@@ -1,0 +1,8 @@
+target/
+captures/
+.DS_Store
+.claude/
+
+# reference video and notes, not part of the project
+*.mp4
+Custom Engine Forest Showcase.md
