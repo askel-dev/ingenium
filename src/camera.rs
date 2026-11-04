@@ -3,6 +3,9 @@
 use crate::terrain::Terrain;
 use glam::{Mat4, Vec2, Vec3};
 
+/// The near plane distance.
+pub const NEAR: f32 = 0.1;
+
 #[derive(Clone, Copy)]
 pub struct Camera {
     pub pos: Vec3,
@@ -26,7 +29,7 @@ impl Camera {
 
     /// Reversed-Z, infinite far plane.
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        glam::camera::rh::proj::directx::perspective_infinite_reverse(self.fov_y, aspect, 0.1)
+        glam::camera::rh::proj::directx::perspective_infinite_reverse(self.fov_y, aspect, NEAR)
     }
 
     pub fn look_dir(&mut self, dir: Vec3) {

@@ -4,7 +4,8 @@
 @group(1) @binding(0) var<uniform> P: Pass;
 
 struct VOut {
-    @builtin(position) clip: vec4f,
+    // invariant: the occluder pass lays down this depth, and the main pass must match it
+    @builtin(position) @invariant clip: vec4f,
     @location(0) wp: vec3f,
 }
 
@@ -76,6 +77,95 @@ fn sward(p: vec2f, fp: f32) -> vec3f {
     return acc;
 }
 
+struct Litter {
+    col: vec3f,
+    tilt: vec2f, // where the leaves curl: added to the ground normal's x and z
+}
+
+// Fallen leaves in three overlapping layers (the top one wins), with twigs on top. Each leaf
+// is a pointed oval with a midrib, brown to ochre, the odd one russet or dark and rotting.
+// A leaf's centre stays in the middle half of its cell and it is at most 1.5 cells long, so
+// the 2x2 cells around a point are the only ones that can reach it. Where a pixel covers
+// several leaves it all fades to the average colour, so it doesn't sparkle.
+fn litter(p: vec2f, fp: f32) -> Litter {
+    var out: Litter;
+    out.col = vec3f(0.085, 0.064, 0.042);
+    out.tilt = vec2f(0.0);
+    let far = smoothstep(0.02, 0.08, fp);
+    if (far >= 1.0) {
+        return out;
+    }
+    var col = vec3f(0.035, 0.028, 0.02); // humus between the leaves
+    var tilt = vec2f(0.0);
+    for (var layer = 0; layer < 3; layer++) {
+        let cell = 0.1 + f32(layer) * 0.025;
+        let q = p / cell + vec2f(f32(layer) * 17.31, f32(layer) * -9.71);
+        let base = vec2i(floor(q - 0.5));
+        for (var j = 0; j < 4; j++) {
+            let ci = base + vec2i(j & 1, j >> 1);
+            let h = hash_i2(ci + vec2i(layer * 4099, 1237));
+            let c = vec2f(ci) + 0.25 + 0.5 * vec2f(u01(h), u01(pcg(h)));
+            let a = u01(pcg(h + 7u)) * TAU;
+            let dir = vec2f(cos(a), sin(a));
+            let rel = (q - c) * cell;
+            let u = dot(rel, dir);
+            let v = dot(rel, vec2f(-dir.y, dir.x));
+            let len = cell * mix(0.4, 0.75, u01(pcg(h + 3u)));
+            let t = u / len;
+            if (abs(t) >= 1.0) {
+                continue;
+            }
+            let half_w = len * 0.45 * sqrt(1.0 - t * t) * (1.0 - 0.35 * t);
+            let cov = smoothstep(-fp, fp, half_w - abs(v));
+            if (cov <= 0.0) {
+                continue;
+            }
+            let r = u01(pcg(h + 11u));
+            // grey-brown, the odd ochre or russet one, many dark and rotting
+            var lc = mix(vec3f(0.095, 0.072, 0.05), vec3f(0.15, 0.115, 0.075), r);
+            lc = mix(lc, vec3f(0.19, 0.13, 0.06), step(0.85, r));
+            lc = mix(lc, vec3f(0.15, 0.07, 0.035), step(0.97, r));
+            lc = mix(lc, vec3f(0.05, 0.04, 0.03), smoothstep(0.4, 0.75, u01(pcg(h + 13u))));
+            lc *= 1.0 - 0.3 * (1.0 - smoothstep(0.0, fp + 0.004, abs(v)));
+            col = mix(col, lc, cov);
+            // curled up along the length and across, at random
+            let curl = vec2f(-dir.y, dir.x) * (v / half_w) * 0.5 + dir * t * 0.35;
+            tilt = mix(tilt, curl * (u01(pcg(h + 17u)) - 0.3), cov);
+        }
+    }
+    // twigs
+    let tcell = 0.7;
+    let tq = p / tcell;
+    let tbase = vec2i(floor(tq - 0.5));
+    for (var j = 0; j < 4; j++) {
+        let ci = tbase + vec2i(j & 1, j >> 1);
+        let h = hash_i2(ci + vec2i(-771, 5003));
+        if (u01(h) > 0.45) {
+            continue;
+        }
+        let c = vec2f(ci) + 0.25 + 0.5 * vec2f(u01(pcg(h)), u01(pcg(h + 1u)));
+        let a = u01(pcg(h + 2u)) * TAU;
+        let dir = vec2f(cos(a), sin(a));
+        let rel = (tq - c) * tcell;
+        let u = dot(rel, dir);
+        let len = tcell * mix(0.25, 0.7, u01(pcg(h + 3u)));
+        if (abs(u) >= len) {
+            continue;
+        }
+        let w = mix(0.004, 0.011, u01(pcg(h + 4u))) * (1.0 - 0.5 * abs(u) / len);
+        let v = dot(rel, vec2f(-dir.y, dir.x)) + sin(u * 23.0 + a) * 0.006;
+        let cov = smoothstep(fp, -fp, abs(v) - w) * min(w / fp, 1.0);
+        col = mix(col, vec3f(0.10, 0.08, 0.06), cov);
+    }
+    out.col = mix(col, out.col, far);
+    out.tilt = tilt * (1.0 - far);
+    return out;
+}
+
+// The occluder pass: depth only (the colour target is there for the trees' alpha-to-coverage).
+@fragment
+fn fs_depth() {}
+
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
     let p = in.wp.xz;
@@ -124,10 +214,16 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let soil_c = mix(vec3f(0.085, 0.066, 0.046), vec3f(0.135, 0.105, 0.072), nz2) * (0.85 + 0.25 * nz) * (1.0 + 0.2 * sw.x);
     var ground = mix(grass, soil_c, soil_amt);
 
-    // --- forest floor: leaf litter, moss
-    var floor_c = mix(vec3f(0.10, 0.07, 0.04), vec3f(0.19, 0.13, 0.075), nz2) * (0.8 + 0.3 * nz);
-    floor_c = mix(floor_c, vec3f(0.05, 0.10, 0.025), smoothstep(0.55, 0.8, nz) * 0.7);
+    // --- forest floor: leaf litter, twigs, moss
     let wood = smoothstep(0.35, 0.75, forest);
+    var floor_c = mix(vec3f(0.10, 0.07, 0.04), vec3f(0.19, 0.13, 0.075), nz2) * (0.8 + 0.3 * nz);
+    var curl = vec2f(0.0);
+    if (wood > 0.0) {
+        let lt = litter(p, fp);
+        floor_c = lt.col * (0.8 + 0.4 * nz);
+        curl = lt.tilt;
+    }
+    floor_c = mix(floor_c, vec3f(0.05, 0.10, 0.025), smoothstep(0.55, 0.8, nz) * 0.6);
     var albedo = mix(ground, floor_c, wood);
 
     let rock_c = mix(vec3f(0.11, 0.105, 0.10), vec3f(0.22, 0.21, 0.19), nz2) * (0.75 + 0.35 * nz);
@@ -137,6 +233,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // grass cover decides how much the sward relief and the sward's look apply
     let grassy = (1.0 - wood) * (1.0 - rock_amt) * (1.0 - soil_amt * 0.7);
     n = normalize(n + vec3f(-sw.y, 0.0, -sw.z) * mix(0.35, 1.0, grassy));
+    n = normalize(n + vec3f(curl.x, 0.0, curl.y) * wood * (1.0 - rock_amt));
 
     let L = F.sun_dir.xyz;
     let ndl = max(dot(n, L), 0.0);
@@ -173,11 +270,11 @@ struct CanopyOut {
     @location(1) ground: f32,
 }
 
-// At most 15.5 * (0.85 + 0.25 * 0.75) = 16.1 m; SHELL_PAD in terrain.rs culls with that.
+// At most 18 * (0.85 + 0.25 * 0.75) = 18.7 m; SHELL_PAD in terrain.rs culls with that.
 fn shell_height(p: vec2f) -> f32 {
     let forest = data_at(p).x;
     let crowns = gnoise(p * 0.19) * 0.5 + gnoise(p * 0.43) * 0.25;
-    return 15.5 * smoothstep(0.2, 0.7, forest) * (0.85 + 0.25 * crowns);
+    return 18.0 * smoothstep(0.2, 0.7, forest) * (0.85 + 0.25 * crowns);
 }
 
 @vertex

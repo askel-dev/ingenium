@@ -1,12 +1,12 @@
 //! Procedurally painted foliage textures (one array layer per species):
-//! 0 = broadleaf cluster, 1 = birch twig, 2 = spruce sprig.
+//! 0 = broadleaf cluster, 1 = birch twig, 2 = spruce sprig, 3 = fern frond (undergrowth).
 //! Mip levels keep their alpha-tested coverage so distant canopies don't thin out.
 
 use glam::Vec2;
 use wgpu::*;
 
 pub const SIZE: u32 = 512;
-pub const LAYERS: u32 = 3;
+pub const LAYERS: u32 = 4;
 
 struct Img {
     w: usize,
@@ -202,6 +202,43 @@ fn paint_spruce(img: &mut Img, rng: &mut Rng) {
     }
 }
 
+/// A fern frond, base at the bottom edge and tip at the top: a rachis with pairs of pinnae,
+/// longest a third of the way up, each cut into rounded pinnules.
+fn paint_fern(img: &mut Img, rng: &mut Rng) {
+    let s = img.w as f32;
+    let base = Vec2::new(0.5 * s, 0.995 * s);
+    let tip = Vec2::new(0.5 * s, 0.02 * s);
+    img.capsule(base, tip, 2.0, lin([0.28, 0.32, 0.12]));
+    let pairs = 21;
+    for i in 0..pairs {
+        let t = 0.05 + 0.93 * (i as f32 + rng.f() * 0.25) / pairs as f32;
+        let p = base + (tip - base) * t;
+        // pinna length: grows to a third of the way up, then tapers to the tip
+        let shape = if t < 0.33 { 0.6 + 0.4 * (t / 0.33) } else { 1.0 - (t - 0.33) / 0.67 * 0.92 };
+        let len = 0.43 * s * shape * rng.range(0.92, 1.05);
+        let light = 0.8 + 0.35 * t;
+        for side in [-1.0f32, 1.0] {
+            // pinnae sweep towards the tip
+            let d = rot(Vec2::new(0.0, -1.0), side * rng.range(1.15, 1.3));
+            let end = p + d * len;
+            img.capsule(p, end, 1.0, lin([0.22, 0.30, 0.10]));
+            // pinnules: small rounded lobes in pairs along the pinna, pointing forwards
+            let lobes = ((len / s) * 30.0).max(2.0) as i32;
+            for k in 0..lobes {
+                let u = (k as f32 + 0.5) / lobes as f32;
+                let q = p + (end - p) * u;
+                let lobe_len = (0.03 * s * (1.0 - 0.55 * u) * shape.sqrt()).max(3.0);
+                let r = rng.f();
+                let c = lin([0.20 + 0.05 * r, 0.33 + 0.05 * r, 0.08 + 0.02 * r]).map(|v| v * light);
+                for lside in [-1.0f32, 1.0] {
+                    let ld = rot(d, lside * 0.9);
+                    img.leaf(q, ld, lobe_len, 0.45, c);
+                }
+            }
+        }
+    }
+}
+
 fn to_srgb(v: f32) -> u8 {
     let v = v.clamp(0.0, 1.0);
     let s = if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
@@ -290,7 +327,8 @@ pub fn build(device: &Device, queue: &Queue) -> (Texture, TextureView) {
         match layer {
             0 => paint_broadleaf(&mut img, &mut rng, false),
             1 => paint_broadleaf(&mut img, &mut rng, true),
-            _ => paint_spruce(&mut img, &mut rng),
+            2 => paint_spruce(&mut img, &mut rng),
+            _ => paint_fern(&mut img, &mut rng),
         }
         for (mip, data) in build_mips(img).into_iter().enumerate() {
             let w = (SIZE >> mip).max(1);
@@ -306,23 +344,25 @@ pub fn build(device: &Device, queue: &Queue) -> (Texture, TextureView) {
     (tex, view)
 }
 
-/// Write the three foliage layers side by side as a PNG (debugging aid).
+/// Write the foliage layers side by side as a PNG (debugging aid).
 pub fn debug_png(path: &str) {
     let w = SIZE as usize;
-    let mut out = vec![0u8; w * 3 * w * 4];
-    for layer in 0..3 {
+    let n = LAYERS as usize;
+    let mut out = vec![0u8; w * n * w * 4];
+    for layer in 0..n {
         let mut img = Img::new(w);
         let mut rng = Rng(0x9E3779B97F4A7C15 ^ (layer as u64 + 1) * 0x51ED27);
         match layer {
             0 => paint_broadleaf(&mut img, &mut rng, false),
             1 => paint_broadleaf(&mut img, &mut rng, true),
-            _ => paint_spruce(&mut img, &mut rng),
+            2 => paint_spruce(&mut img, &mut rng),
+            _ => paint_fern(&mut img, &mut rng),
         }
         for y in 0..w {
             for x in 0..w {
                 let p = img.px[y * w + x];
                 let bg = [0.55f32, 0.6, 0.65];
-                let o = (y * w * 3 + layer * w + x) * 4;
+                let o = (y * w * n + layer * w + x) * 4;
                 for k in 0..3 {
                     out[o + k] = to_srgb(p[k] * p[3] + bg[k].powf(2.2) * (1.0 - p[3]));
                 }
@@ -330,5 +370,5 @@ pub fn debug_png(path: &str) {
             }
         }
     }
-    crate::write_png(path, (w * 3) as u32, w as u32, &out);
+    crate::write_png(path, (w * n) as u32, w as u32, &out);
 }

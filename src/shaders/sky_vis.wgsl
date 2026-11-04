@@ -24,7 +24,7 @@ struct GenParams {
 const DIRS: u32 = 16u;
 const STEPS: u32 = 22u;
 
-const CANOPY_H: f32 = 15.0;
+const CANOPY_H: f32 = 18.0;
 // how much of the sky a canopy overhead blocks
 const CANOPY_BLOCK: f32 = 0.6;
 

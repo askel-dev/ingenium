@@ -6,9 +6,12 @@
 mod bloom;
 mod camera;
 mod clouds;
+mod exposure;
 mod forest;
 mod gpu;
 mod grass;
+mod hiz;
+mod hud;
 mod leaftex;
 mod player;
 mod renderer;
@@ -16,6 +19,7 @@ mod sky;
 mod ssao;
 mod terrain;
 mod treegen;
+mod undergrowth;
 mod util;
 
 use camera::{Camera, FlyPath};
@@ -57,6 +61,11 @@ struct Args {
     vsync: bool,
     lod_tint: bool,
     ssao: bool,
+    hud: bool,
+    /// Render scale; None in a window means one scene pixel per point (half on Retina).
+    scale: Option<f32>,
+    prepass: bool,
+    occlusion: bool,
     leaf_png: Option<String>,
 }
 
@@ -74,6 +83,10 @@ fn parse_args() -> Args {
         vsync: true,
         lod_tint: false,
         ssao: true,
+        hud: false,
+        scale: None,
+        prepass: true,
+        occlusion: true,
         leaf_png: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -105,6 +118,10 @@ fn parse_args() -> Args {
             "--novsync" => a.vsync = false,
             "--lod-tint" => a.lod_tint = true,
             "--no-ao" => a.ssao = false,
+            "--hud" => a.hud = true,
+            "--no-prepass" => a.prepass = false,
+            "--no-occlusion" => a.occlusion = false,
+            "--scale" => { a.scale = next(i).parse().ok(); i += 1; }
             "--leaf-png" => { a.leaf_png = Some(next(i)); i += 1; }
             other => eprintln!("unknown argument: {other}"),
         }
@@ -128,7 +145,7 @@ fn main() {
         "controls: Tab cinematic/player · click to grab mouse, Esc to release · V walk/fly\n\
          \x20 walk:    WASD move, Space jump, Shift sprint, Ctrl/C crouch\n\
          \x20 fly:     WASD move, Space/E up, Q/C down, Shift fast, Ctrl slow\n\
-         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · G grass · F11 fullscreen · P print camera"
+         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · G grass · H stats overlay · -/= render scale · F11 fullscreen · P print camera"
     );
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App { args, state: None };
@@ -144,6 +161,11 @@ fn capture(args: &Args) {
     r.settings.sun_shift = args.sun_shift;
     r.settings.lod_tint = args.lod_tint;
     r.settings.ssao = args.ssao;
+    r.settings.prepass = args.prepass;
+    r.settings.occlusion = args.occlusion;
+    if let Some(s) = args.scale {
+        r.set_scale(&gpu.device, s);
+    }
     let path = FlyPath::new(&r.terrain);
     let cam = match args.cam {
         // a negative height means that far above the ground
@@ -166,15 +188,34 @@ fn capture(args: &Args) {
         view_formats: &[],
     });
     let view = tex.create_view(&Default::default());
+    // the first half of the frames warms up (cloud reprojection, caches); the rest are timed
+    let warmup = (args.frames / 2) as u64;
+    let (mut cpu_ms, mut wall_ms) = (Vec::new(), Vec::new());
     for f in 0..args.frames {
+        let t0 = Instant::now();
         r.render(&gpu.device, &gpu.queue, &view, &cam, args.time + f as f32 / 60.0);
+        let t1 = Instant::now();
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        if f as u64 >= warmup {
+            cpu_ms.push((t1 - t0).as_secs_f32() * 1000.0);
+            wall_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
+        }
     }
     // two more frames so the stats and timestamps of the last frames land
     r.render(&gpu.device, &gpu.queue, &view, &cam, args.time + args.frames as f32 / 60.0);
     gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
     r.render(&gpu.device, &gpu.queue, &view, &cam, args.time + args.frames as f32 / 60.0);
     gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    let timings: Vec<GpuTiming> = r.take_timings().into_iter().filter(|t| t.frame > warmup).collect();
+    if args.hud {
+        // a capture waits for the GPU after every frame, so its fps is unthrottled (no vsync)
+        let mut hud = hud::Hud::new(&gpu.device, fmt);
+        let fps = 1000.0 / median(wall_ms.into_iter()).unwrap_or(f32::INFINITY);
+        let cpu = median(cpu_ms.into_iter()).unwrap_or(0.0);
+        let gpu_ms = median(timings.iter().map(|t| t.total_ms)).unwrap_or(0.0);
+        hud.set_text(&format!("{fps:.1} fps   cpu {cpu:.2} ms   gpu {gpu_ms:.2} ms"));
+        hud.draw(&gpu.device, &gpu.queue, &view, args.width, args.height, 1.0);
+    }
 
     let row = (args.width * 4).div_ceil(256) * 256;
     let buf = util::buffer(&gpu.device, "capture rb", (row * args.height) as u64, wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ);
@@ -197,9 +238,6 @@ fn capture(args: &Args) {
     let out = args.capture.as_ref().unwrap();
     write_png(out, args.width, args.height, &rgba);
 
-    // the first half of the frames warms up (cloud reprojection, caches); the rest are timed
-    let warmup = (args.frames / 2) as u64;
-    let timings: Vec<GpuTiming> = r.take_timings().into_iter().filter(|t| t.frame > warmup).collect();
     let ms = |v: Option<f32>| v.map_or("n/a".to_string(), |x| format!("{x:.2}"));
     println!(
         "captured {out} ({}x{}) cam=({:.1},{:.1},{:.1}) yaw={:.3} pitch={:.3}\n  gpu {} ms (median of {} frames, whole frame) · {} ms through the main pass · {}",
@@ -276,6 +314,7 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     gpu: gpu::Gpu,
     renderer: Renderer,
+    hud: hud::Hud,
     path: FlyPath,
     cam: Camera,
     player: Player,
@@ -319,6 +358,10 @@ impl App {
         renderer.settings.sun_shift = self.args.sun_shift;
         renderer.settings.lod_tint = self.args.lod_tint;
         renderer.settings.ssao = self.args.ssao;
+        renderer.settings.prepass = self.args.prepass;
+        renderer.settings.occlusion = self.args.occlusion;
+        renderer.set_scale(&gpu.device, self.args.scale.unwrap_or(1.0 / window.scale_factor() as f32));
+        let hud = hud::Hud::new(&gpu.device, format);
         let path = FlyPath::new(&renderer.terrain);
         let cam = path.camera(self.args.time, &renderer.terrain, FOV_Y);
         let trunks = Trunks::new(&renderer.forest.read_trees(&gpu.device, &gpu.queue), renderer.terrain.world);
@@ -329,6 +372,7 @@ impl App {
             config,
             gpu,
             renderer,
+            hud,
             path,
             cam,
             player: Player::new(),
@@ -444,6 +488,14 @@ impl State {
             }
             KeyCode::KeyG => s.grass = !s.grass,
             KeyCode::KeyO => s.ssao = !s.ssao,
+            KeyCode::KeyH => self.hud.visible = !self.hud.visible,
+            KeyCode::Minus | KeyCode::Equal => {
+                const STEPS: [f32; 6] = [0.5, 0.6, 0.67, 0.75, 0.85, 1.0];
+                let now = STEPS.iter().position(|&x| x >= self.renderer.scale - 0.01).unwrap_or(STEPS.len() - 1);
+                let next = if code == KeyCode::Minus { now.saturating_sub(1) } else { (now + 1).min(STEPS.len() - 1) };
+                self.renderer.set_scale(&self.gpu.device, STEPS[next]);
+                println!("render scale {:.2}: {}x{}", self.renderer.scale, self.renderer.width, self.renderer.height);
+            }
             KeyCode::KeyP => {
                 let c = self.cam;
                 println!("--cam {:.1},{:.1},{:.1},{:.3},{:.3}", c.pos.x, c.pos.y, c.pos.z, c.yaw, c.pitch);
@@ -470,6 +522,8 @@ impl State {
         let view = frame.texture.create_view(&Default::default());
         let time = (now - self.start).as_secs_f32();
         self.renderer.render(&self.gpu.device, &self.gpu.queue, &view, &self.cam, time);
+        let (w, h) = (self.config.width, self.config.height);
+        self.hud.draw(&self.gpu.device, &self.gpu.queue, &view, w, h, self.window.scale_factor());
         let cpu_ms = cpu0.elapsed().as_secs_f32() * 1000.0;
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
@@ -493,6 +547,8 @@ impl State {
                 renderer::atmosphere(self.renderer.settings.atmos).name
             );
             self.window.set_title(&title);
+            let (rw, rh) = (self.renderer.width, self.renderer.height);
+            self.hud.set_text(&format!("{fps:.1} fps   cpu {cpu:.2} ms   gpu {gpu:.2} ms   {rw}x{rh}"));
             self.frame_times.clear();
             self.cpu_times.clear();
             self.title_timer = 0.0;

@@ -4,8 +4,11 @@
 use crate::bloom::Bloom;
 use crate::camera::Camera;
 use crate::clouds::Clouds;
-use crate::forest::{Forest, ViewSetup, DRAWS};
+use crate::forest::{Forest, TreePass, ViewSetup, CULL_PLANES, DRAWS, LODS, OCCLUDER_LODS};
+use crate::hiz::Hiz;
+use crate::exposure::Exposure;
 use crate::grass::Grass;
+use crate::undergrowth::Undergrowth;
 use crate::leaftex;
 use crate::sky::{Sky, SkyParams};
 use crate::ssao::Ssao;
@@ -169,6 +172,12 @@ pub struct Settings {
     pub sun_shift: f32,
     /// Screen-space ambient occlusion (`O`).
     pub ssao: bool,
+    /// Lay down the trees' depth before shading them, so each covered sample is shaded once
+    /// (`--no-prepass` turns it off to compare).
+    pub prepass: bool,
+    /// Draw the terrain and the near trees first, then cull the distant trees hidden behind
+    /// them (`--no-occlusion` turns it off to compare). Needs the prepass.
+    pub occlusion: bool,
 }
 
 #[derive(Default, Clone)]
@@ -197,8 +206,10 @@ const TS_BLOOM: u32 = 6;
 const TS_POST: u32 = 7;
 const TIMESTAMPS: u32 = 8;
 /// What each timed section covers. A section runs from the end of the one before it, so
-/// the atmosphere tables count with the clouds and the near cascade with the shadows.
-pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+grass", "sky+clouds", "shadows", "main", "ssao", "bloom", "post"];
+/// the atmosphere tables count with the clouds and the near cascade with the shadows. The
+/// first covers the culling, the grass and, with occlusion culling, the occluder pass, the
+/// depth pyramid and the second culling pass.
+pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+occluders", "sky+clouds", "shadows", "main", "ssao", "bloom", "post"];
 
 /// GPU time of one frame, from its timestamps.
 #[derive(Clone, Copy, Debug)]
@@ -280,8 +291,14 @@ struct Frozen {
 }
 
 pub struct Renderer {
+    /// The size the scene is rendered at: the output size times `scale`.
     pub width: u32,
     pub height: u32,
+    /// The size of the image `render` writes (the window or the capture).
+    pub out_width: u32,
+    pub out_height: u32,
+    /// Render scale: the post pass upscales the scene to the output size when below 1.
+    pub scale: f32,
     msaa: u32,
     frame_buf: Buffer,
     global_bg: BindGroup,
@@ -293,6 +310,7 @@ pub struct Renderer {
     targets: Targets,
     sky_pipe: RenderPipeline,
     post_pipe: RenderPipeline,
+    exposure: Exposure,
     post_bgl: BindGroupLayout,
     post_bg: BindGroup,
     post_buf: Buffer,
@@ -300,9 +318,11 @@ pub struct Renderer {
     sky: Sky,
     bloom: Bloom,
     ssao: Ssao,
+    hiz: Hiz,
     pub terrain: Terrain,
     pub forest: Forest,
     grass: Grass,
+    undergrowth: Undergrowth,
     clouds: Clouds,
     timestamp_period: f32,
     readbacks: Vec<Readback>,
@@ -338,7 +358,8 @@ fn make_targets(device: &Device, w: u32, h: u32, msaa: u32) -> Targets {
     Targets { color_msaa, depth, hdr }
 }
 
-fn post_bind_group(device: &Device, bgl: &BindGroupLayout, hdr: &TextureView, buf: &Buffer, bloom: &Bloom, sampler: &Sampler, sky: &Sky, ssao: &Ssao) -> BindGroup {
+#[allow(clippy::too_many_arguments)]
+fn post_bind_group(device: &Device, bgl: &BindGroupLayout, hdr: &TextureView, buf: &Buffer, bloom: &Bloom, sampler: &Sampler, sky: &Sky, ssao: &Ssao, exposure: &Exposure) -> BindGroup {
     bind_group(
         device,
         "post",
@@ -350,32 +371,103 @@ fn post_bind_group(device: &Device, bgl: &BindGroupLayout, hdr: &TextureView, bu
             BindingResource::Sampler(sampler),
             sky.light_buf.as_entire_binding(),
             BindingResource::TextureView(ssao.output()),
+            exposure.state.as_entire_binding(),
         ],
     )
 }
 
-/// Stable cascade: bounding sphere of the frustum slice, snapped to shadow texels.
-fn cascade_matrix(cam: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3) -> (Mat4, f32) {
+/// Corners of the camera frustum between the view depths `near` and `far`.
+fn slice_corners(cam: &Camera, aspect: f32, near: f32, far: f32) -> [Vec3; 8] {
     let ty = (cam.fov_y * 0.5).tan();
     let tx = ty * aspect;
     let inv_view = cam.view().inverse();
-    let mut corners = Vec::with_capacity(8);
-    for z in [near, far] {
-        for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-            corners.push(inv_view.transform_point3(Vec3::new(sx * tx * z, sy * ty * z, -z)));
+    let mut corners = [Vec3::ZERO; 8];
+    for (i, z) in [near, far].into_iter().enumerate() {
+        for (j, (sx, sy)) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)].into_iter().enumerate() {
+            corners[i * 4 + j] = inv_view.transform_point3(Vec3::new(sx * tx * z, sy * ty * z, -z));
         }
     }
+    corners
+}
+
+/// The sun's view: a rotation only, looking along the sunlight.
+fn light_view(sun: Vec3) -> Mat4 {
+    let up = if sun.y.abs() > 0.99 { Vec3::X } else { Vec3::Y };
+    glam::camera::rh::view::look_to_mat4(Vec3::ZERO, -sun, up)
+}
+
+/// Stable cascade: bounding sphere of the frustum slice, snapped to shadow texels.
+fn cascade_matrix(cam: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3) -> (Mat4, f32) {
+    let corners = slice_corners(cam, aspect, near, far);
     let center = corners.iter().fold(Vec3::ZERO, |a, c| a + *c) / 8.0;
     let mut radius = corners.iter().map(|c| c.distance(center)).fold(0.0, f32::max);
     radius = (radius * 4.0).ceil() / 4.0;
     let texel = 2.0 * radius / SHADOW_RES as f32;
-    let up = if sun.y.abs() > 0.99 { Vec3::X } else { Vec3::Y };
-    let light_view = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, -sun, up);
+    let light_view = light_view(sun);
     let mut c = light_view.transform_point3(center);
     c.x = (c.x / texel).floor() * texel;
     c.y = (c.y / texel).floor() * texel;
     let proj = glam::camera::rh::proj::directx::orthographic(c.x - radius, c.x + radius, c.y - radius, c.y + radius, -c.z - radius - 1500.0, -c.z + radius + 20.0);
     (proj * light_view, texel)
+}
+
+/// Convex hull of a few points, counter-clockwise (monotone chain).
+fn convex_hull(mut pts: Vec<Vec2>) -> Vec<Vec2> {
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    let half = |pts: &mut dyn Iterator<Item = Vec2>| {
+        let mut h: Vec<Vec2> = Vec::new();
+        for p in pts {
+            while h.len() >= 2 && (h[h.len() - 1] - h[h.len() - 2]).perp_dot(p - h[h.len() - 2]) <= 0.0 {
+                h.pop();
+            }
+            h.push(p);
+        }
+        h.pop();
+        h
+    };
+    let mut hull = half(&mut pts.iter().copied());
+    hull.extend(half(&mut pts.iter().rev().copied()));
+    hull
+}
+
+/// Culling planes for the trees a cascade draws. A tree can only shade the part of the view
+/// the cascade covers if it stands between that part and the sun, but the cascade's box is a
+/// square around a sphere that holds it: most trees in the box cast their shadows off screen,
+/// behind the camera or onto ground that is shaded by the other cascade. So the planes are the
+/// outline of the view, between the distances `d0` and `d1` from the camera, as the sun sees
+/// it (swept towards the sun), plus one plane past its far side from the sun, all moved out by
+/// `margin`. `None` if the outline doesn't fit in the planes (a degenerate view).
+fn caster_planes(cam: &Camera, aspect: f32, d0: f32, d1: f32, sun: Vec3, margin: f32) -> Option<[Vec4; CULL_PLANES]> {
+    // a point at distance d inside the frustum is at least d / (length of a corner ray) deep
+    let ty = (cam.fov_y * 0.5).tan();
+    let tx = ty * aspect;
+    let near = (d0 / (1.0 + tx * tx + ty * ty).sqrt()).max(0.1);
+    let corners = slice_corners(cam, aspect, near, d1);
+    let lv = light_view(sun);
+    let hull = convex_hull(corners.iter().map(|c| lv.transform_point3(*c).truncate()).collect());
+    if hull.len() < 3 || hull.len() > CULL_PLANES - 1 {
+        return None;
+    }
+    let inv = lv.inverse();
+    let mut planes = [Vec4::new(0.0, 0.0, 0.0, 1.0); CULL_PLANES];
+    for (i, &a) in hull.iter().enumerate() {
+        let e = hull[(i + 1) % hull.len()] - a;
+        if e.length() < 1e-4 {
+            continue; // leaving a plane out only keeps more trees
+        }
+        let n = Vec2::new(-e.y, e.x).normalize(); // inwards: the hull runs counter-clockwise
+        planes[i] = inv.transform_vector3(n.extend(0.0)).extend(margin - n.dot(a));
+    }
+    let back = corners.iter().map(|c| c.dot(sun)).fold(f32::INFINITY, f32::min);
+    planes[hull.len()] = sun.extend(margin - back);
+    Some(planes)
+}
+
+/// A frustum's planes, padded with planes that keep everything.
+fn pad_planes(p: [Vec4; 6]) -> [Vec4; CULL_PLANES] {
+    let mut out = [Vec4::new(0.0, 0.0, 0.0, 1.0); CULL_PLANES];
+    out[..6].copy_from_slice(&p);
+    out
 }
 
 impl Renderer {
@@ -521,7 +613,8 @@ impl Renderer {
 
         let mut terrain = terrain;
         terrain.create_pipelines(device, &global_bgl, &pass_bgl, HDR, msaa);
-        let forest = Forest::new(device, queue, &global_bgl, &global_bg, &pass_bgl, HDR, msaa, WORLD);
+        let mut forest = Forest::new(device, queue, &global_bgl, &global_bg, &pass_bgl, HDR, msaa, WORLD);
+        let undergrowth = Undergrowth::new(device, &global_bgl, &forest.tree_bgl);
         let grass = Grass::new(device, &global_bgl, &pass_bgl, HDR, msaa);
 
         // sky
@@ -544,15 +637,16 @@ impl Renderer {
             device,
             "post",
             &[
-                texture_entry(0, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: false }, TextureViewDimension::D2),
+                texture_entry(0, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
                 uniform_entry(1, ShaderStages::FRAGMENT),
                 texture_entry(2, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
                 sampler_entry(3, ShaderStages::FRAGMENT, SamplerBindingType::Filtering),
                 uniform_entry(4, ShaderStages::FRAGMENT),
                 texture_entry(5, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
+                storage_entry(6, ShaderStages::FRAGMENT, true),
             ],
         );
-        let post_buf = buffer(device, "post", 16, BufferUsages::UNIFORM | BufferUsages::COPY_DST);
+        let post_buf = buffer(device, "post", 32, BufferUsages::UNIFORM | BufferUsages::COPY_DST);
         let module = shader(device, "post", &[NOISE_WGSL, include_str!("shaders/post.wgsl")]);
         let out_targets = [Some(ColorTargetState { format: out_format, blend: None, write_mask: ColorWrites::ALL })];
         let post_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -569,13 +663,16 @@ impl Renderer {
         let targets = make_targets(device, width, height, msaa);
         let bloom = Bloom::new(device, HDR, &targets.hdr, width, height);
         let ssao = Ssao::new(device, &global_bgl, &targets.depth, msaa, width, height);
+        let hiz = Hiz::new(device, &targets.depth, msaa, width, height);
+        forest.set_hiz(device, hiz.view(), hiz.info());
         let post_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("post"),
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
             ..Default::default()
         });
-        let post_bg = post_bind_group(device, &post_bgl, &targets.hdr, &post_buf, &bloom, &post_sampler, &sky, &ssao);
+        let exposure = Exposure::new(device, &targets.hdr);
+        let post_bg = post_bind_group(device, &post_bgl, &targets.hdr, &post_buf, &bloom, &post_sampler, &sky, &ssao, &exposure);
 
         let readbacks = (0..3)
             .map(|_| Readback {
@@ -593,6 +690,9 @@ impl Renderer {
         Renderer {
             width,
             height,
+            out_width: width,
+            out_height: height,
+            scale: 1.0,
             msaa,
             frame_buf,
             global_bg,
@@ -604,6 +704,7 @@ impl Renderer {
             targets,
             sky_pipe,
             post_pipe,
+            exposure,
             post_bgl,
             post_bg,
             post_buf,
@@ -611,9 +712,11 @@ impl Renderer {
             sky,
             bloom,
             ssao,
+            hiz,
             terrain,
             forest,
             grass,
+            undergrowth,
             clouds,
             timestamp_period: queue.get_timestamp_period(),
             readbacks,
@@ -621,20 +724,37 @@ impl Renderer {
             frame_index: 0,
             stats: Stats::default(),
             frozen: None,
-            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true },
+            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true, prepass: true, occlusion: true },
             _leaf: leaf_tex,
             _dummies: [dummy_shadow, dummy_2d, dummy_3d],
         }
     }
 
+    /// The output size changed (window resize).
     pub fn resize(&mut self, device: &Device, width: u32, height: u32) {
-        self.width = width.max(1);
-        self.height = height.max(1);
+        self.out_width = width.max(1);
+        self.out_height = height.max(1);
+        self.rebuild_targets(device);
+    }
+
+    /// Render the scene at `scale` times the output size (clamped to 0.25..1).
+    pub fn set_scale(&mut self, device: &Device, scale: f32) {
+        self.scale = scale.clamp(0.25, 1.0);
+        self.rebuild_targets(device);
+    }
+
+    fn rebuild_targets(&mut self, device: &Device) {
+        let scaled = |n: u32| ((n as f32 * self.scale).round() as u32).clamp(1, n);
+        self.width = scaled(self.out_width);
+        self.height = scaled(self.out_height);
         self.targets = make_targets(device, self.width, self.height, self.msaa);
         self.clouds.resize(device, self.width, self.height);
         self.bloom.resize(device, HDR, &self.targets.hdr, self.width, self.height);
         self.ssao.resize(device, &self.targets.depth, self.width, self.height);
-        self.post_bg = post_bind_group(device, &self.post_bgl, &self.targets.hdr, &self.post_buf, &self.bloom, &self.post_sampler, &self.sky, &self.ssao);
+        self.hiz.resize(device, &self.targets.depth, self.width, self.height);
+        self.forest.set_hiz(device, self.hiz.view(), self.hiz.info());
+        self.exposure.set_target(device, &self.targets.hdr);
+        self.post_bg = post_bind_group(device, &self.post_bgl, &self.targets.hdr, &self.post_buf, &self.bloom, &self.post_sampler, &self.sky, &self.ssao, &self.exposure);
     }
 
     pub fn render(&mut self, device: &Device, queue: &Queue, out: &TextureView, cam: &Camera, time: f32) {
@@ -698,17 +818,33 @@ impl Renderer {
         for (b, p) in self.pass_bufs.iter().zip(passes.iter()) {
             queue.write_buffer(b, 0, bytemuck::bytes_of(p));
         }
-        queue.write_buffer(&self.post_buf, 0, cast_slice(&[atm.exposure, BLOOM, 1.0 / self.bloom.levels() as f32, EXPOSURE_KEY]));
+        let upscale = (self.width, self.height) != (self.out_width, self.out_height);
+        queue.write_buffer(&self.post_buf, 0, cast_slice(&[atm.exposure, BLOOM, 1.0 / self.bloom.levels() as f32, EXPOSURE_KEY, upscale as u32 as f32, 0.0, 0.0, 0.0]));
 
         let shadow_planes = [frustum_planes(svp0), frustum_planes(svp1)];
         self.terrain.select(queue, Vec2::new(ref_pos.x, ref_pos.z), MAX_TREE_DIST * 0.6, &[cull_planes, shadow_planes[0], shadow_planes[1]]);
-        self.forest.update_view(queue, 0, &ViewSetup { planes: cull_planes, ref_pos, max_dist: MAX_TREE_DIST, lod: LOD_DIST });
+        // Occlusion culling tests against the depth the current camera sees, so it is off while
+        // culling is frozen at another camera.
+        let occlusion = self.settings.occlusion && self.settings.prepass && self.frozen.is_none();
+        let proj = cam.proj(aspect);
+        self.forest.update_view(
+            queue,
+            0,
+            &ViewSetup { planes: pad_planes(cull_planes), ref_pos, max_dist: MAX_TREE_DIST, lod: LOD_DIST, occlusion: occlusion.then(|| (cam.view(), Vec2::new(proj.x_axis.x, proj.y_axis.y))) },
+        );
+        // what each cascade shades (shadow_at in globals.wgsl): the near one up to its far
+        // distance, the far one from where the blend between them starts
+        let receivers = [(0.0, CASCADES[0].1), (0.8 * CASCADES[0].1, CASCADES[1].1)];
         for (i, planes) in shadow_planes.iter().enumerate() {
             let mut lod = LOD_DIST;
             lod.w = [0.0f32, 3.0][i]; // far cascade casts from the cheap hull LOD only
-            self.forest.update_view(queue, 1 + i, &ViewSetup { planes: *planes, ref_pos, max_dist: CASCADES[i].1 + 60.0, lod });
+            // a metre for wind sway and the normal offset, plus the filter's reach
+            let margin = 1.0 + 3.0 * [texel0, texel1][i];
+            let planes = caster_planes(cam, aspect, receivers[i].0, receivers[i].1, sun, margin).unwrap_or(pad_planes(*planes));
+            self.forest.update_view(queue, 1 + i, &ViewSetup { planes, ref_pos, max_dist: CASCADES[i].1 + 60.0, lod, occlusion: None });
         }
         self.grass.update(queue, cull_planes, ref_pos);
+        self.undergrowth.update(queue, cull_planes, ref_pos);
         self.clouds.update(queue, vp_rot, cam, sun, fu.cloud_shadow, fu.clouds);
 
         // Stats readback (non-blocking ring): a frame whose slot is free is timed and read back.
@@ -724,14 +860,58 @@ impl Renderer {
 
         let mut enc = device.create_command_encoder(&Default::default());
         {
-            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(TS_START), end_of_pass_write_index: Some(TS_CULL) });
+            let end = (!occlusion).then_some(TS_CULL);
+            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(TS_START), end_of_pass_write_index: end });
             let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("cull"), timestamp_writes: tw });
             for v in 0..3 {
                 self.forest.cull(&mut cp, &self.global_bg, v);
             }
             if self.settings.grass {
                 self.grass.generate(&mut cp, &self.global_bg);
+                self.undergrowth.generate(&mut cp, &self.global_bg);
             }
+        }
+        let (view, resolve) = match &self.targets.color_msaa {
+            Some(m) => (m, Some(&self.targets.hdr)),
+            None => (&self.targets.hdr, None),
+        };
+        if occlusion {
+            // Under the canopy almost every distant tree is hidden behind the near ones, yet
+            // they are most of the triangles. So the terrain and the near trees lay down their
+            // depth first, a depth pyramid is built from it, and the distant trees are culled
+            // against that. Nothing is carried over from the last frame, so a tree is never late.
+            // It all happens before the sky and the shadows, which don't depend on it, so the
+            // GPU can overlap them with it instead of the main pass waiting on it.
+            let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("occluders"),
+                // only there for the leaves' alpha-to-coverage: nothing is written to it
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Discard },
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &self.targets.depth,
+                    depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // the bind group without the shadow, cloud and haze maps: depth needs none of them,
+            // and binding them would make this wait for the passes that write them
+            rp.set_bind_group(0, &self.global_bg_shadow, &[]);
+            rp.set_bind_group(1, &self.pass_bgs[0], &[]);
+            self.terrain.draw_depth(&mut rp);
+            rp.set_bind_group(2, &self.pass_bgs[0], &[]);
+            self.forest.draw(&mut rp, 0, TreePass::Depth, 0..OCCLUDER_LODS);
+            drop(rp);
+            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(TS_CULL) });
+            let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("occlusion cull"), timestamp_writes: tw });
+            self.hiz.build(&mut cp);
+            self.forest.cull_occluded(&mut cp, &self.global_bg_shadow);
         }
         // the atmosphere tables; timed together with the clouds
         let sky_params = SkyParams { sun_dir: sun, sun_illum: SUN_ILLUM, haze: atm.haze, cam_alt_m: cam.pos.y, overcast: atm.overcast, ground_albedo: 0.12, fog: fu.fog };
@@ -760,13 +940,9 @@ impl Renderer {
             rp.set_bind_group(1, &self.pass_bgs[1 + c], &[]);
             self.terrain.draw(&mut rp, 1 + c);
             rp.set_bind_group(2, &self.pass_bgs[1 + c], &[]);
-            self.forest.draw(&mut rp, 1 + c, true, 3);
+            self.forest.draw(&mut rp, 1 + c, TreePass::Shadow, 0..LODS);
         }
         {
-            let (view, resolve) = match &self.targets.color_msaa {
-                Some(m) => (m, Some(&self.targets.hdr)),
-                None => (&self.targets.hdr, None),
-            };
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -777,7 +953,7 @@ impl Renderer {
                 })],
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &self.targets.depth,
-                    depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
+                    depth_ops: Some(Operations { load: if occlusion { LoadOp::Load } else { LoadOp::Clear(0.0) }, store: StoreOp::Store }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: pass_end(TS_MAIN),
@@ -785,12 +961,27 @@ impl Renderer {
                 multiview_mask: None,
             });
             rp.set_bind_group(0, &self.global_bg, &[]);
+            rp.set_bind_group(2, &self.pass_bgs[0], &[]);
+            // Leaves are cut out by alpha-to-coverage, which turns off the GPU's hidden surface
+            // removal: every leaf fragment that passes the depth test so far is shaded, in
+            // whatever order the culling appended the trees. Laying down their depth first
+            // (cheap: one texture read) lets the colour pass shade only the nearest surface.
+            // LOD 3 is an opaque hull with no leaf cards: nothing to gain, so it is drawn once.
+            // (with occlusion culling the near LODs' depth is already there)
+            if self.settings.prepass {
+                self.forest.draw(&mut rp, 0, TreePass::Depth, if occlusion { OCCLUDER_LODS..3 } else { 0..3 });
+            }
             rp.set_bind_group(1, &self.pass_bgs[0], &[]);
             self.terrain.draw(&mut rp, 0);
             self.terrain.draw_canopy(&mut rp);
-            rp.set_bind_group(2, &self.pass_bgs[0], &[]);
-            self.forest.draw(&mut rp, 0, false, 3);
+            if self.settings.prepass {
+                self.forest.draw(&mut rp, 0, TreePass::ColorEqual, 0..3);
+                self.forest.draw(&mut rp, 0, TreePass::Color, 3..LODS);
+            } else {
+                self.forest.draw(&mut rp, 0, TreePass::Color, 0..LODS);
+            }
             if self.settings.grass {
+                self.undergrowth.draw(&mut rp, self.forest.color_pipeline());
                 self.grass.draw(&mut rp);
             }
             rp.set_pipeline(&self.sky_pipe);
@@ -805,6 +996,7 @@ impl Renderer {
             self.ssao.clear(&mut enc);
         }
         self.bloom.record(&mut enc, pass_end(TS_BLOOM));
+        self.exposure.record(queue, &mut enc, time);
         {
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("post"),
@@ -914,6 +1106,52 @@ mod tests {
 
     fn close(a: Option<f32>, b: f32) -> bool {
         a.is_some_and(|a| (a - b).abs() < 1e-4)
+    }
+
+    #[test]
+    fn hull_drops_inner_points_and_runs_counter_clockwise() {
+        let pts = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (1.0, 1.0), (1.0, 0.0)];
+        let hull = convex_hull(pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect());
+        assert_eq!(hull.len(), 4);
+        let area: f32 = (0..4).map(|i| hull[i].perp_dot(hull[(i + 1) % 4])).sum::<f32>() * 0.5;
+        assert!((area - 4.0).abs() < 1e-5, "signed area {area}");
+    }
+
+    fn inside(planes: &[Vec4; CULL_PLANES], p: Vec3) -> bool {
+        planes.iter().all(|pl| pl.truncate().dot(p) + pl.w >= 0.0)
+    }
+
+    #[test]
+    fn caster_planes_keep_every_tree_that_can_shade_the_view() {
+        let cam = Camera { pos: Vec3::new(100.0, 50.0, 200.0), yaw: 0.7, pitch: -0.2, fov_y: 0.95 };
+        let aspect = 16.0 / 9.0;
+        let (ty, inv_view) = ((cam.fov_y * 0.5).tan(), cam.view().inverse());
+        let mut seed = 1u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        // the sun ahead of the camera and low, behind it, and overhead
+        for sun in [Vec3::new(0.6, 0.15, -0.5), Vec3::new(-0.5, 0.6, 0.5), Vec3::new(0.0, 1.0, 0.001)] {
+            let sun = sun.normalize();
+            for (d0, d1) in [(0.0, 50.0), (40.0, 260.0)] {
+                let planes = caster_planes(&cam, aspect, d0, d1, sun, 0.01).expect("planes");
+                for _ in 0..500 {
+                    // a point the cascade shades: inside the view, between d0 and d1 away
+                    let dir = Vec3::new((rnd() * 2.0 - 1.0) * ty * aspect, (rnd() * 2.0 - 1.0) * ty, -1.0).normalize();
+                    let p = inv_view.transform_point3(dir * (d0 + (d1 - d0) * rnd()).max(0.2));
+                    for t in [0.0, 5.0, 30.0, 120.0] {
+                        assert!(inside(&planes, p + sun * t), "sun {sun} d {d0}..{d1}: lost a caster {t} m towards the sun");
+                    }
+                }
+            }
+        }
+        // the sun ahead: nothing behind the camera or far off to the side casts into the view
+        let sun = Vec3::new(0.6, 0.15, -0.5).normalize();
+        let planes = caster_planes(&cam, aspect, 0.0, 50.0, sun, 1.0).unwrap();
+        assert!(!inside(&planes, cam.pos - cam.forward() * 40.0));
+        assert!(!inside(&planes, cam.pos + cam.forward() * 25.0 + cam.right() * 80.0));
+        assert!(inside(&planes, cam.pos + cam.forward() * 25.0));
     }
 
     #[test]

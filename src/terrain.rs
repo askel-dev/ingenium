@@ -26,7 +26,7 @@ const SHELL: usize = VIEWS;
 const DETAIL_PAD: f32 = 1.0;
 /// Highest the canopy shell rises above the ground (`shell_height` in terrain.wgsl,
 /// at most 16.1 m), with margin.
-const SHELL_PAD: f32 = 17.0;
+const SHELL_PAD: f32 = 19.5;
 
 pub struct Terrain {
     pub world: f32,
@@ -48,6 +48,7 @@ pub struct Terrain {
     lists: [(u32, u32); LISTS],
     ranges: [f32; LEVELS],
     pipe: Option<RenderPipeline>,
+    pipe_depth: Option<RenderPipeline>,
     pipe_shadow: Option<RenderPipeline>,
     pipe_canopy: Option<RenderPipeline>,
 }
@@ -192,6 +193,7 @@ impl Terrain {
             lists: [(0, 0); LISTS],
             ranges,
             pipe: None,
+            pipe_depth: None,
             pipe_shadow: None,
             pipe_canopy: None,
         }
@@ -214,10 +216,12 @@ impl Terrain {
         let layout = pipeline_layout(device, &[global, pass]);
         let attrs = [VertexAttribute { format: VertexFormat::Float32x4, offset: 0, shader_location: 0 }];
         let vbl = VertexBufferLayout { array_stride: 16, step_mode: VertexStepMode::Instance, attributes: &attrs };
-        let make = |shadow: bool| {
-            let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::ALL })];
+        // the camera's colour pass, its depth-only occluder pass, or a shadow cascade
+        let make = |shadow: bool, depth_only: bool| {
+            let mask = if depth_only { ColorWrites::empty() } else { ColorWrites::ALL };
+            let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: mask })];
             device.create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some(if shadow { "terrain shadow" } else { "terrain" }),
+                label: Some(if shadow { "terrain shadow" } else if depth_only { "terrain depth" } else { "terrain" }),
                 layout: Some(&layout),
                 vertex: VertexState {
                     module: &module,
@@ -237,7 +241,7 @@ impl Terrain {
                 } else {
                     Some(FragmentState {
                         module: &module,
-                        entry_point: Some("fs"),
+                        entry_point: Some(if depth_only { "fs_depth" } else { "fs" }),
                         compilation_options: Default::default(),
                         targets: &targets,
                     })
@@ -246,8 +250,9 @@ impl Terrain {
                 cache: None,
             })
         };
-        self.pipe = Some(make(false));
-        self.pipe_shadow = Some(make(true));
+        self.pipe = Some(make(false, false));
+        self.pipe_depth = Some(make(false, true));
+        self.pipe_shadow = Some(make(true, false));
 
         let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::ALL })];
         self.pipe_canopy = Some(device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -347,6 +352,18 @@ impl Terrain {
         }
         let pipe = if view == 0 { &self.pipe } else { &self.pipe_shadow };
         pass.set_pipeline(pipe.as_ref().unwrap());
+        pass.set_vertex_buffer(0, self.patch_buf.slice(..));
+        pass.set_index_buffer(self.index_buf.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..self.index_count, 0, first..first + count);
+    }
+
+    /// The camera's patches, depth only (the occluder pass before the main pass).
+    pub fn draw_depth(&self, pass: &mut RenderPass<'_>) {
+        let (first, count) = self.lists[0];
+        if count == 0 {
+            return;
+        }
+        pass.set_pipeline(self.pipe_depth.as_ref().unwrap());
         pass.set_vertex_buffer(0, self.patch_buf.slice(..));
         pass.set_index_buffer(self.index_buf.slice(..), IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, first..first + count);

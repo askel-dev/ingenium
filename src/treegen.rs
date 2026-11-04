@@ -141,12 +141,15 @@ fn grow(rng: &mut Rng, p: &Params, tree: &mut Tree, start: Vec3, dir: Vec3, len:
     let mut pts = vec![start];
     let mut rads = vec![radius];
     let mut d = dir;
+    // A trunk that forks into limbs keeps most of its girth up to the fork; everything else
+    // tapers towards a thin tip.
+    let taper = if level == 0 && !p.excurrent { 0.4 } else { 0.72 };
     for i in 1..=nseg {
         d = (d + rng.unit() * p.wiggle[level as usize] + Vec3::Y * p.tropism[level as usize]).normalize();
         let last = *pts.last().unwrap();
         pts.push(last + d * (len / nseg as f32));
         let t = i as f32 / nseg as f32;
-        rads.push(radius * (1.0 - 0.72 * t));
+        rads.push(radius * (1.0 - taper * t));
     }
     let br = Branch { pts, rads, level, limb };
     let me = tree.branches.len();
@@ -190,7 +193,8 @@ fn build_skeleton(p: &Params, seed: u64) -> Tree {
         let n = rng.count(3, 4);
         for c in 0..n {
             let phi = c as f32 / n as f32 * TAU + rng.range(-0.3, 0.3);
-            let ang = rng.range(0.6, 0.95);
+            // forest-grown: the limbs reach up more than out, for a narrower crown
+            let ang = rng.range(0.36, 0.62);
             let d = Vec3::new(phi.cos() * ang.sin(), ang.cos(), phi.sin() * ang.sin()).normalize();
             let len = p.height * (1.0 - p.trunk_frac) * rng.range(0.85, 1.05);
             grow(&mut rng, p, &mut tree, top.0, d, len, top.2 * 0.75, 1, 0);
@@ -245,6 +249,10 @@ fn crown_of(tree: &Tree, height: f32, scale: Vec3) -> Crown {
         let r = d[(d.len() as f32 * 0.85) as usize % d.len()] + 0.6;
         spheres.push((c, r));
     }
+    // and one filling out the middle, or a crown of up-reaching limbs makes a hull shaped
+    // like an umbrella
+    let mid = radii.x.min(radii.z) * 0.85;
+    spheres.push((center - Vec3::Y * radii.y * 0.15, mid));
     Crown { center, radii, height, spheres }
 }
 
@@ -405,11 +413,23 @@ fn emit_hull(mesh: &mut Mesh, crown: &Crown, sub: u32, shrink: f32, rng: &mut Rn
     }
 }
 
+/// Leaves deep inside a crown are in the shade of the outer ones and die off, so a crown
+/// is a shell of leaves around a mostly open inside. Light gets through it to the forest
+/// floor, and from below you see the limbs.
+fn keep_leaf(pos: Vec3, crown: &Crown, rng: &mut Rng) -> bool {
+    let depth = ((pos - crown.center) / crown.radii).length();
+    let t = ((depth - 0.35) / 0.5).clamp(0.0, 1.0);
+    rng.f() < 0.1 + t * t * (3.0 - 2.0 * t)
+}
+
 fn place_cards(mesh: &mut Mesh, tree: &Tree, crown: &Crown, rng: &mut Rng, levels: &[u32], per_branch: u32, size: f32) {
     for b in tree.branches.iter().filter(|b| levels.contains(&b.level)) {
         for k in 0..per_branch {
             let t = 0.2 + 0.8 * (k as f32 + rng.f()) / per_branch as f32;
             let (pos, d, _) = b.at(t);
+            if !keep_leaf(pos, crown, rng) {
+                continue;
+            }
             let out = ((pos - crown.center) / crown.radii).normalize_or(Vec3::Y);
             let axis = (d * 0.45 + out * 0.55 + rng.unit() * 0.55).normalize();
             let side = axis.cross(rng.unit()).normalize_or(Vec3::X);
@@ -431,6 +451,9 @@ fn broadleaf(name: &'static str, p: Params, seed: u64) -> Species {
         emit_tube(&mut lods[0], b, sides, 1, &crown);
     }
     for &(pos, d, _) in &tree.leaves {
+        if !keep_leaf(pos, &crown, &mut rng) {
+            continue;
+        }
         let out = ((pos - crown.center) / crown.radii).normalize_or(Vec3::Y);
         let axis = (d * 0.5 + out * 0.5 + rng.unit() * 0.6).normalize();
         let side = axis.cross(rng.unit()).normalize_or(Vec3::X);
@@ -447,17 +470,22 @@ fn broadleaf(name: &'static str, p: Params, seed: u64) -> Species {
 
     // LOD2
     emit_tube(&mut lods[2], &tree.branches[0], 4, 4, &crown);
+    // the main limbs too, or the trunk ends in a stump under the crown
+    for b in tree.branches.iter().filter(|b| b.level == 1) {
+        emit_tube(&mut lods[2], b, 3, 3, &crown);
+    }
     place_cards(&mut lods[2], &tree, &crown, &mut rng, &[2], 3, p.leaf_size * 2.6);
     emit_hull(&mut lods[2], &crown, 1, 0.74, &mut rng);
 
-    // LOD3
+    // LOD3: the hull on a bare 3-sided trunk (6 triangles), so the crown doesn't float now
+    // that it starts high up
     let trunk = Branch {
-        pts: vec![Vec3::ZERO, tree.branches[0].at(0.6).0],
-        rads: vec![p.trunk_r, p.trunk_r * 0.7],
+        pts: vec![Vec3::new(0.0, -0.3, 0.0), tree.branches[0].at(0.9).0],
+        rads: vec![p.trunk_r, p.trunk_r * 0.6],
         level: 0,
         limb: 0,
     };
-    let _ = trunk;
+    emit_tube(&mut lods[3], &trunk, 3, 1, &crown);
     emit_hull(&mut lods[3], &crown, 1, 1.0, &mut rng);
 
     finish(name, lods)
@@ -604,34 +632,36 @@ fn finish(name: &'static str, lods: Vec<Mesh>) -> Species {
 }
 
 pub fn build_all() -> Vec<Species> {
+    // Forest-grown trees: they shed their lower branches in the shade, so the trunks stand
+    // bare up to a crown that starts about halfway up.
     let oak = Params {
-        height: 18.0,
-        trunk_frac: 0.38,
+        height: 21.0,
+        trunk_frac: 0.46,
         trunk_r: TRUNK_R[0],
         children: [(2, 3), (5, 7), (4, 6)],
-        child_start: [0.55, 0.2, 0.2],
-        angle: [(0.5, 0.9), (0.6, 1.1), (0.5, 1.0)],
-        len_ratio: [0.9, 0.55, 0.5],
+        child_start: [0.72, 0.25, 0.2],
+        angle: [(0.5, 0.9), (0.5, 0.95), (0.5, 1.0)],
+        len_ratio: [0.6, 0.45, 0.5],
         excurrent: false,
         tropism: [0.02, 0.06, 0.03, -0.02],
         wiggle: [0.05, 0.16, 0.25, 0.3],
-        leaf_size: 1.45,
-        leaves_per_twig: 8,
+        leaf_size: 1.3,
+        leaves_per_twig: 6,
         crown_scale: Vec3::new(1.1, 1.0, 1.1),
     };
     let birch = Params {
         height: 17.0,
         trunk_frac: 1.0,
         trunk_r: TRUNK_R[1],
-        children: [(12, 16), (4, 6), (3, 5)],
-        child_start: [0.32, 0.2, 0.25],
+        children: [(11, 14), (4, 6), (3, 5)],
+        child_start: [0.45, 0.2, 0.25],
         angle: [(0.55, 0.85), (0.5, 0.9), (0.6, 1.1)],
         len_ratio: [0.4, 0.6, 0.55],
         excurrent: true,
         tropism: [0.0, 0.03, -0.12, -0.22],
         wiggle: [0.04, 0.14, 0.22, 0.3],
-        leaf_size: 1.05,
-        leaves_per_twig: 8,
+        leaf_size: 1.0,
+        leaves_per_twig: 6,
         crown_scale: Vec3::new(1.05, 1.0, 1.05),
     };
     let species = vec![broadleaf("broadleaf", oak, 0x1234_5678_9ABC), broadleaf("birch", birch, 0xBEEF_F00D_1357), spruce(0x5EED_5EED_2468)];
@@ -640,4 +670,146 @@ pub fn build_all() -> Vec<Species> {
         println!("tree '{}': LOD tris [{}], bound r={:.1} m", s.name, tris.join(", "), s.radius);
     }
     species
+}
+
+/// Forest-floor plants, drawn with the tree shader (see undergrowth.rs). Each comes with the
+/// leaf texture layer it uses and the radius of a sphere around it (for culling).
+pub struct Plant {
+    pub name: &'static str,
+    pub mesh: Mesh,
+    pub layer: u32,
+    pub radius: f32,
+}
+
+fn plant_crown(height: f32, radius: f32) -> Crown {
+    Crown { center: Vec3::new(0.0, height * 0.5, 0.0), radii: Vec3::new(radius, height * 0.5, radius).max(Vec3::splat(0.2)), height, spheres: Vec::new() }
+}
+
+/// A fern: fronds rising from one crown and arching outwards, each a bent textured strip.
+fn fern(seed: u64) -> Mesh {
+    let mut rng = Rng(seed);
+    let mut m = Mesh::default();
+    let fronds = 13;
+    for f in 0..fronds {
+        let phi = f as f32 / fronds as f32 * TAU + rng.range(-0.25, 0.25);
+        let out = Vec3::new(phi.cos(), 0.0, phi.sin());
+        let len = rng.range(0.75, 1.1);
+        let width = len * 0.62;
+        let mut el = rng.range(0.85, 1.25); // starting angle above the horizontal
+        let segs = 5;
+        let mut p = out * 0.04;
+        let side = Vec3::Y.cross(out).normalize();
+        let start = m.verts.len() as u32;
+        for k in 0..=segs {
+            let t = k as f32 / segs as f32;
+            let dir = out * el.cos() + Vec3::Y * el.sin();
+            // the frond is cupped a little across its width
+            let n = (dir.cross(side).normalize() * -1.0 + Vec3::Y * 0.6).normalize();
+            let n = if n.y < 0.0 { -n } else { n };
+            let w = width * 0.5 * (0.35 + 0.65 * (t * 3.0).min(1.0));
+            let sway = 0.5 * t * t;
+            let ao = 0.45 + 0.55 * t;
+            m.vert(p - side * w + Vec3::Y * w * 0.12, n, Vec2::new(0.0, 1.0 - t), KIND_LEAF, sway, ao);
+            m.vert(p + side * w + Vec3::Y * w * 0.12, n, Vec2::new(1.0, 1.0 - t), KIND_LEAF, sway, ao);
+            p += dir * (len / segs as f32);
+            el -= rng.range(0.22, 0.32); // arching over
+        }
+        for k in 0..segs as u32 {
+            let a = start + k * 2;
+            m.tri(a, a + 1, a + 3);
+            m.tri(a, a + 3, a + 2);
+        }
+    }
+    m
+}
+
+/// A shrub: a few stems from the ground, branching twice, with small leaf cards.
+fn shrub(seed: u64, height: f32, card: f32) -> Mesh {
+    let mut rng = Rng(seed);
+    let p = Params {
+        height,
+        trunk_frac: 1.0,
+        trunk_r: 0.025,
+        children: [(3, 4), (3, 4), (2, 3)],
+        child_start: [0.3, 0.3, 0.3],
+        angle: [(0.5, 0.9), (0.6, 1.0), (0.5, 1.0)],
+        len_ratio: [0.6, 0.55, 0.5],
+        excurrent: false,
+        tropism: [0.05, 0.05, 0.0, -0.05],
+        wiggle: [0.1, 0.2, 0.3, 0.3],
+        leaf_size: card,
+        leaves_per_twig: 3,
+        crown_scale: Vec3::ONE,
+    };
+    let mut tree = Tree { branches: Vec::new(), leaves: Vec::new() };
+    let stems = rng.count(3, 5);
+    for k in 0..stems {
+        let phi = k as f32 / stems as f32 * TAU + rng.range(-0.4, 0.4);
+        let d = Vec3::new(phi.cos() * 0.5, 1.0, phi.sin() * 0.5).normalize();
+        let len = height * rng.range(0.75, 1.0);
+        grow(&mut rng, &p, &mut tree, Vec3::new(phi.cos(), 0.0, phi.sin()) * 0.05, d, len, 0.022, 1, k as usize);
+    }
+    for b in tree.branches.iter() {
+        let count = match b.level {
+            3 => p.leaves_per_twig,
+            2 => 1,
+            _ => 0,
+        };
+        for k in 0..count {
+            let t = 0.3 + 0.7 * (k as f32 + rng.f()) / count as f32;
+            let (pos, d, _) = b.at(t);
+            tree.leaves.push((pos, d, b.limb));
+        }
+    }
+    let crown = crown_of(&tree, height, Vec3::ONE);
+    let mut m = Mesh::default();
+    for b in tree.branches.iter().filter(|b| b.level == 1) {
+        emit_tube(&mut m, b, 3, 2, &crown);
+    }
+    for &(pos, d, _) in &tree.leaves {
+        let out = ((pos - crown.center) / crown.radii).normalize_or(Vec3::Y);
+        let axis = (d * 0.5 + out * 0.5 + rng.unit() * 0.6).normalize();
+        let side = axis.cross(rng.unit()).normalize_or(Vec3::X);
+        let s = card * rng.range(0.8, 1.2);
+        emit_card(&mut m, pos - axis * s * 0.1, axis, side, s, s, &crown);
+    }
+    for v in m.verts.iter_mut() {
+        v.attr[1] *= 0.35; // stiff: short stems barely sway
+    }
+    m
+}
+
+/// Low ground cover (woodruff, bramble, seedlings): a clump of leaf cards just above the ground.
+fn ground_cover(seed: u64) -> Mesh {
+    let mut rng = Rng(seed);
+    let crown = plant_crown(0.35, 0.5);
+    let mut m = Mesh::default();
+    for k in 0..9 {
+        let phi = k as f32 / 9.0 * TAU + rng.range(-0.3, 0.3);
+        let out = Vec3::new(phi.cos(), 0.0, phi.sin());
+        let el = rng.range(0.25, 0.7);
+        let axis = (out * el.cos() + Vec3::Y * el.sin()).normalize();
+        let side = Vec3::Y.cross(out).normalize();
+        let s = rng.range(0.38, 0.55);
+        let base = out * rng.range(0.0, 0.15) + Vec3::Y * rng.range(0.0, 0.08);
+        let start = m.verts.len() as u32;
+        emit_card(&mut m, base, axis, side, s, s, &crown);
+        for v in &mut m.verts[start as usize..] {
+            v.nrm = (Vec3::from(v.nrm) * 0.4 + Vec3::Y).normalize().into();
+            v.attr[1] *= 0.25;
+        }
+    }
+    m
+}
+
+pub fn build_plants() -> Vec<Plant> {
+    let plants = vec![
+        Plant { name: "fern", mesh: fern(0xFE12_0001), layer: 3, radius: 1.3 },
+        Plant { name: "shrub", mesh: shrub(0x5821_0B02, 1.6, 0.55), layer: 0, radius: 1.6 },
+        Plant { name: "ground cover", mesh: ground_cover(0x6C0F_E203), layer: 0, radius: 0.7 },
+    ];
+    for p in &plants {
+        println!("plant '{}': {} tris", p.name, p.mesh.tris());
+    }
+    plants
 }

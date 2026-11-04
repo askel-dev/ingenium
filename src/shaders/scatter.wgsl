@@ -34,7 +34,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let dat = data_at(p);
     let h = height_at(p);
     let n = normal_at(p);
-    var density = dat.x * 0.95 + 0.003;
+    // A closed forest still has gaps: where an old tree fell, thinner stands. They let
+    // sunflecks through to the floor.
+    let gaps = mix(0.45, 1.0, smoothstep(-0.35, 0.2, gnoise(p * 0.03 + vec2f(5.1, -2.3))));
+    var density = dat.x * 0.85 * gaps + 0.003;
     density *= 1.0 - smoothstep(0.22, 0.4, 1.0 - n.y);
     density *= 1.0 - dat.y * 0.85;
     if (u01(h2) >= density) {

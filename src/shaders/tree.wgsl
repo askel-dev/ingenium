@@ -13,7 +13,8 @@ struct VIn {
 }
 
 struct VOut {
-    @builtin(position) clip: vec4f,
+    // invariant: the prepass and the shading pass must compute bit-identical depth
+    @builtin(position) @invariant clip: vec4f,
     @location(0) wp: vec3f,
     @location(1) nrm: vec3f,
     @location(2) uv: vec2f,
@@ -128,7 +129,11 @@ fn fs(in: VOut) -> @location(0) vec4f {
         albedo = canopy_color(species) * tint * (0.95 + 0.45 * nz);
     }
 
-    var sh = shadow_at(in.wp, n);
+    // Beyond the near cascade the trees cast their canopy hulls, which enclose their own
+    // leaves: the shadow is looked up a little towards the sun, outside the tree's own hull.
+    let dist = distance(in.wp, F.cam_pos.xyz);
+    let lift = select(0.0, 2.5, kind != 0u) * smoothstep(F.cascade.x * 0.75, F.cascade.x, dist);
+    var sh = shadow_at(in.wp + L * lift, n);
     if (kind == 2u) {
         sh = mix(sh, 1.0, 0.4);
     }
@@ -154,12 +159,42 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let spec = pow(max(dot(n, H), 0.0), 12.0) * fres * max(dot(n, L), 0.0);
         let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * fres * 0.35;
         col += (sun * spec * sh + sheen * ao) * select(1.0, 0.5, kind == 2u);
+        if (kind == 1u) {
+            // Leaves are thin: light falling on one side comes out of the other, yellower.
+            // The crown's normals point outwards, so the leaves under a crown glow with the
+            // sun and sky on their upper side, as a canopy does seen from below.
+            let tcol = albedo * vec3f(1.15, 1.2, 0.55);
+            let through = sun * max(dot(-n, L), 0.0) * sh * 0.5 + ambient_vis(-n, in.wp, vis) * ao * 0.6;
+            col += tcol * through;
+        }
     }
     if (F.debug.x > 0.5) {
         col = mix(col, lod_tint(in.info.w) * 0.3, 0.6);
     }
     col = apply_fog(col, in.wp);
     return vec4f(col, alpha);
+}
+
+// Leaf coverage, as `fs` computes it: the alpha edge sharpened to about a pixel wide.
+fn leaf_alpha(in: VOut) -> f32 {
+    let tex = textureSample(t_leaf, s_repeat, in.uv, i32(in.info.x));
+    let aw = max(fwidth(tex.a), 1e-4);
+    return select(1.0, clamp((tex.a - 0.5) / aw + 0.5, 0.0, 1.0), in.info.y == 1u);
+}
+
+// The depth prepass with MSAA: the alpha only drives alpha-to-coverage (no colour is written).
+@fragment
+fn fs_depth(in: VOut) -> @location(0) vec4f {
+    return vec4f(0.0, 0.0, 0.0, leaf_alpha(in));
+}
+
+// The depth prepass without MSAA: an alpha test.
+@fragment
+fn fs_depth_test(in: VOut) -> @location(0) vec4f {
+    if (leaf_alpha(in) < 0.5) {
+        discard;
+    }
+    return vec4f(0.0);
 }
 
 @fragment

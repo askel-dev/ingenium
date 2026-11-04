@@ -165,11 +165,23 @@ fn sky_vis(p: vec2f) -> f32 {
 fn ambient_vis(n: vec3f, wp: vec3f, vis: f32) -> vec3f {
     let up = n.y * 0.5 + 0.5;
     let bounce = SKY.amb_ground.rgb;
-    let from_above = SKY.amb_up.rgb * vis + bounce * 0.5 * (1.0 - vis);
+    let cs = cloud_shadow(wp);
+    // Where trees block the sky, what is seen instead is the underside of their leaves, lit
+    // through by the sun and the sky above them: green light, most of the light on a forest
+    // floor. (A stand-in for the light bounced and transmitted through the canopy.)
+    let leafy = smoothstep(0.3, 0.7, data_at(wp.xz).x);
+    let sun_above = SKY.sun.rgb * max(F.sun_dir.y, 0.0) * cs.x;
+    let through = (sun_above / PI + SKY.amb_up.rgb) * CANOPY_TRANSMIT;
+    let blocked = mix(bounce * 0.5, through, leafy);
+    let from_above = SKY.amb_up.rgb * vis + blocked * (1.0 - vis);
     let sky = mix(bounce, from_above, up) * F.sun_color.w;
-    let cloud = SKY.sun.rgb * max(F.sun_dir.y, 0.0) * cloud_shadow(wp).y * up * vis;
+    let cloud = SKY.sun.rgb * max(F.sun_dir.y, 0.0) * cs.y * up * vis;
     return sky + cloud;
 }
+
+// Share of the light falling on a canopy that comes out underneath, through and between the
+// leaves (green: leaves pass green and absorb the rest).
+const CANOPY_TRANSMIT: vec3f = vec3f(0.07, 0.13, 0.03);
 
 fn ambient(n: vec3f, wp: vec3f) -> vec3f {
     return ambient_vis(n, wp, sky_vis(wp.xz));
