@@ -6,6 +6,7 @@ struct Post {
     bloom_norm: f32, // 1 / number of bloom levels summed
     key: f32,        // light on flat ground at which `exposure` applies unchanged
     upscale: f32,    // 1 when the scene was rendered below the output size
+    debug_view: f32, // > 0: show one term of the lighting instead (renderer.rs, Settings)
 }
 
 struct SkyLight {
@@ -20,8 +21,10 @@ struct SkyLight {
 @group(0) @binding(2) var t_bloom: texture_2d<f32>;
 @group(0) @binding(3) var s_lin: sampler;
 @group(0) @binding(4) var<uniform> SKY: SkyLight;
-@group(0) @binding(5) var t_ao: texture_2d<f32>;
+@group(0) @binding(5) var t_gi: texture_2d<f32>;      // ssilvb.wgsl: indirect light (rgb), ambient visibility (a)
 @group(0) @binding(6) var<storage, read> EXPO: array<f32, 4>; // x = metered log luminance (exposure.wgsl)
+@group(0) @binding(7) var t_contact: texture_2d<f32>; // ssilvb.wgsl: direct sunlight left after contact shadows
+@group(0) @binding(8) var t_aux: texture_2d<f32>;     // the main pass: albedo (rgb), direct share (a)
 
 struct VOut {
     @builtin(position) clip: vec4f,
@@ -79,13 +82,32 @@ fn aces(x: vec3f) -> vec3f {
 fn fs(in: VOut) -> @location(0) vec4f {
     let px = vec2i(in.clip.xy);
     var c: vec3f;
+    var aux: vec4f;
     if PP.upscale > 0.5 {
         c = upsample(in.uv);
+        aux = textureSampleLevel(t_aux, s_lin, in.uv, 0.0);
     } else {
         c = textureLoad(t_hdr, px, 0).rgb;
+        aux = textureLoad(t_aux, px, 0);
     }
-    // ambient occlusion (ssao.wgsl), already limited to the ambient share of the light
-    c *= textureSampleLevel(t_ao, s_lin, in.uv, 0.0).r;
+    // the screen-space lighting (ssilvb.wgsl): the contact shadows take from the direct sunlight,
+    // the occlusion from the rest, and the light from the surfaces around is added
+    let gi = textureSampleLevel(t_gi, s_lin, in.uv, 0.0);
+    let contact = textureSampleLevel(t_contact, s_lin, in.uv, 0.0).r;
+    let direct = c * aux.a;
+    let lit = c;
+    c = direct * contact + (c - direct) * gi.a + aux.rgb * gi.rgb;
+    if (PP.debug_view > 0.5) {
+        // linear values, untouched by exposure and tonemap (renderer.rs, Settings::debug_view)
+        let k = u32(PP.debug_view + 0.5);
+        var v = vec3f(gi.a);
+        if (k == 2u) { v = vec3f(contact); }
+        if (k == 3u) { v = aux.rgb * gi.rgb / max(lit, vec3f(1e-4)) * 0.5; } // 0.5: doubles the light
+        if (k == 4u) { v = vec3f(aux.a); }
+        if (k == 5u) { v = aux.rgb * 3.0; }
+        if (k == 6u) { v = textureLoad(t_hdr, px, 0).rgb; } // apply_fog wrote the haze terms
+        return vec4f(saturate(v), 1.0);
+    }
     let bloom = textureSampleLevel(t_bloom, s_lin, in.uv, 0.0).rgb * PP.bloom_norm;
     c = mix(c, bloom, PP.bloom);
     // partial eye adaptation: open up as the light falls towards sunset, but only by about

@@ -5,13 +5,14 @@ use crate::bloom::Bloom;
 use crate::camera::Camera;
 use crate::clouds::Clouds;
 use crate::forest::{Forest, TreePass, ViewSetup, CULL_PLANES, DRAWS, LODS, OCCLUDER_LODS};
+use crate::height_shadow::HeightShadow;
 use crate::hiz::Hiz;
 use crate::exposure::Exposure;
 use crate::grass::Grass;
 use crate::undergrowth::Undergrowth;
 use crate::leaftex;
 use crate::sky::{Sky, SkyParams};
-use crate::ssao::Ssao;
+use crate::ssilvb::Ssilvb;
 use crate::terrain::{Terrain, HM_RES, PATCH_TRIS, WORLD};
 use crate::util::*;
 use bytemuck::{cast_slice, Pod, Zeroable};
@@ -56,6 +57,7 @@ struct FrameUniform {
     clouds: Vec4,
     cloud_type: Vec4,
     cloud_shadow: Vec4,
+    sun_grid: Vec4,
     morph: [Vec4; 12],
 }
 
@@ -76,12 +78,16 @@ pub struct Atmosphere {
     /// 0..1: greys the sky light under a cloud deck (the clouds themselves shade the sun).
     overcast: f32,
     /// Gain on the sky's ambient light for the ground and trees. Above 1 it stands in for the
-    /// light bounced off sunlit terrain and foliage, which is not modelled.
+    /// light bounced off sunlit terrain and foliage further away than the screen-space indirect
+    /// light (ssilvb.wgsl) reaches.
     ambient: f32,
     /// Ground haze, an aerosol layer added to the atmosphere: extinction per metre at sea
     /// level and its falloff per metre of height.
     fog_density: f32,
     fog_falloff: f32,
+    /// Haze in the air among the trees, under the canopy (extinction per metre): moisture and
+    /// dust, what the shafts of light show up in.
+    forest_haze: f32,
     /// Cloud layer: base and top altitude (m), coverage 0..1, density, and the range of cloud
     /// types the weather map picks from (0 flat stratus .. 1 towering cumulus).
     cloud_base: f32,
@@ -101,9 +107,10 @@ pub fn atmosphere(preset: usize) -> Atmosphere {
             sun_azim: 105.0,
             haze: 1.6,
             overcast: 0.0,
-            ambient: 2.4,
+            ambient: 1.6,
             fog_density: 0.00085,
             fog_falloff: 0.0075,
+            forest_haze: 0.0025,
             cloud_base: 1400.0,
             cloud_top: 3400.0,
             cloud_cover: 0.38,
@@ -118,9 +125,10 @@ pub fn atmosphere(preset: usize) -> Atmosphere {
             sun_azim: 250.0,
             haze: 1.3,
             overcast: 0.0,
-            ambient: 2.4,
+            ambient: 1.6,
             fog_density: 0.0005,
             fog_falloff: 0.006,
+            forest_haze: 0.0016,
             cloud_base: 1600.0,
             cloud_top: 4200.0,
             cloud_cover: 0.42,
@@ -135,9 +143,10 @@ pub fn atmosphere(preset: usize) -> Atmosphere {
             sun_azim: 160.0,
             haze: 2.5,
             overcast: 1.0,
-            ambient: 1.5,
+            ambient: 1.25,
             fog_density: 0.0008,
             fog_falloff: 0.005,
+            forest_haze: 0.0015,
             cloud_base: 1200.0,
             cloud_top: 3400.0,
             cloud_cover: 0.9,
@@ -152,9 +161,10 @@ pub fn atmosphere(preset: usize) -> Atmosphere {
             sun_azim: 150.0,
             haze: 1.0,
             overcast: 0.0,
-            ambient: 1.7,
+            ambient: 1.2,
             fog_density: 0.00032,
             fog_falloff: 0.006,
+            forest_haze: 0.0011,
             cloud_base: 1600.0,
             cloud_top: 4400.0,
             cloud_cover: 0.5,
@@ -173,14 +183,19 @@ pub struct Settings {
     pub atmos: usize,
     /// Degrees added to the preset's sun elevation (`[` / `]`).
     pub sun_shift: f32,
-    /// Screen-space ambient occlusion (`O`).
-    pub ssao: bool,
+    /// Screen-space indirect light, ambient occlusion and contact shadows (`O`).
+    pub ssilvb: bool,
     /// Lay down the trees' depth before shading them, so each covered sample is shaded once
     /// (`--no-prepass` turns it off to compare).
     pub prepass: bool,
     /// Draw the terrain and the near trees first, then cull the distant trees hidden behind
     /// them (`--no-occlusion` turns it off to compare). Needs the prepass.
     pub occlusion: bool,
+    /// Show one term of the lighting instead of the image (`--debug-view`): 1 the ambient
+    /// light's visibility (SSILVB), 2 the contact shadows, 3 the indirect light added (0.5 where
+    /// it doubles a pixel's light), 4 the share of the light that is direct sun, 5 the albedo,
+    /// 6 the share of the haze in front that lies in shadow (red) and the haze itself (green).
+    pub debug_view: u32,
 }
 
 #[derive(Clone)]
@@ -210,15 +225,16 @@ const TS_CULL: u32 = 1;
 const TS_CLOUDS: u32 = 2;
 const TS_SHADOWS: u32 = 3;
 const TS_MAIN: u32 = 4;
-const TS_SSAO: u32 = 5;
+const TS_GI: u32 = 5;
 const TS_BLOOM: u32 = 6;
 const TS_POST: u32 = 7;
 const TIMESTAMPS: u32 = 8;
 /// What each timed section covers. A section runs from the end of the one before it, so
-/// the atmosphere tables count with the clouds and the near cascade with the shadows. The
-/// first covers the culling, the grass and, with occlusion culling, the occluder pass, the
-/// depth pyramid and the second culling pass.
-pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+occluders", "sky+clouds", "shadows", "main", "ssao", "bloom", "post"];
+/// the terrain shadow map (when the sun moved) and the atmosphere tables count with the
+/// clouds, and the near cascade with the shadows, which end with the shadowed haze
+/// (aerial_near). The first covers the culling, the grass and, with occlusion culling, the
+/// occluder pass, the depth pyramid and the second culling pass.
+pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+occluders", "sky+clouds", "shadows+haze", "main", "ssilvb", "bloom", "post"];
 
 /// GPU time of one frame, from its timestamps.
 #[derive(Clone, Copy, Debug)]
@@ -228,10 +244,10 @@ pub struct GpuTiming {
     /// Start of the culling pass to the end of the tonemap pass: the whole frame.
     pub total_ms: f32,
     /// Start of the culling pass to the end of the main pass, the span the timer covered
-    /// before SSAO, bloom and post were timed (to compare with older measurements).
+    /// before the screen-space lighting, bloom and post were timed (to compare with older measurements).
     pub through_main_ms: Option<f32>,
     /// Time each section of GPU_SECTIONS adds after the ones before it finished. None if
-    /// its timestamp was not taken (SSAO off) or came back invalid; its time then counts
+    /// its timestamp was not taken (SSILVB off) or came back invalid; its time then counts
     /// with the next section.
     pub sections: [Option<f32>; TIMESTAMPS as usize - 1],
     /// Every timestamp taken came back valid and in submission order, so the sections add
@@ -292,6 +308,19 @@ struct Targets {
     color_msaa: Option<TextureView>,
     depth: TextureView,
     hdr: TextureView,
+    /// Albedo and the direct sun's share of the light (util::AUX), multisampled and resolved.
+    aux_msaa: Option<TextureView>,
+    aux: TextureView,
+}
+
+impl Targets {
+    /// The main pass's colour attachments: (view, resolve target) for the HDR colour and aux.
+    fn scene(&self) -> [(&TextureView, Option<&TextureView>); 2] {
+        match (&self.color_msaa, &self.aux_msaa) {
+            (Some(c), Some(a)) => [(c, Some(&self.hdr)), (a, Some(&self.aux))],
+            _ => [(&self.hdr, None), (&self.aux, None)],
+        }
+    }
 }
 
 struct Frozen {
@@ -312,6 +341,8 @@ pub struct Renderer {
     frame_buf: Buffer,
     global_bg: BindGroup,
     global_bg_shadow: BindGroup,
+    /// With the shadow maps but without the near haze volume, for the pass that writes it.
+    global_bg_haze: BindGroup,
     pass_bufs: Vec<Buffer>,
     pass_bgs: Vec<BindGroup>,
     _shadow_tex: Texture,
@@ -326,13 +357,14 @@ pub struct Renderer {
     post_sampler: Sampler,
     sky: Sky,
     bloom: Bloom,
-    ssao: Ssao,
+    ssilvb: Ssilvb,
     hiz: Hiz,
     pub terrain: Terrain,
     pub forest: Forest,
     grass: Grass,
     undergrowth: Undergrowth,
     clouds: Clouds,
+    height_shadow: HeightShadow,
     timestamp_period: f32,
     readbacks: Vec<Readback>,
     /// Timed frames read back since the last `take_timings`.
@@ -361,26 +393,30 @@ fn make_targets(device: &Device, w: u32, h: u32, msaa: u32) -> Targets {
             .create_view(&Default::default())
     };
     let color_msaa = (msaa > 1).then(|| tex("color msaa", HDR, msaa, TextureUsages::RENDER_ATTACHMENT));
-    // read back by the SSAO pass
+    // read back by the screen-space lighting (ssilvb.rs)
     let depth = tex("depth", DEPTH, msaa, TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING);
     let hdr = tex("hdr", HDR, 1, TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING);
-    Targets { color_msaa, depth, hdr }
+    let aux_msaa = (msaa > 1).then(|| tex("aux msaa", AUX, msaa, TextureUsages::RENDER_ATTACHMENT));
+    let aux = tex("aux", AUX, 1, TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING);
+    Targets { color_msaa, depth, hdr, aux_msaa, aux }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn post_bind_group(device: &Device, bgl: &BindGroupLayout, hdr: &TextureView, buf: &Buffer, bloom: &Bloom, sampler: &Sampler, sky: &Sky, ssao: &Ssao, exposure: &Exposure) -> BindGroup {
+fn post_bind_group(device: &Device, bgl: &BindGroupLayout, targets: &Targets, buf: &Buffer, bloom: &Bloom, sampler: &Sampler, sky: &Sky, gi: &Ssilvb, exposure: &Exposure) -> BindGroup {
     bind_group(
         device,
         "post",
         bgl,
         &[
-            BindingResource::TextureView(hdr),
+            BindingResource::TextureView(&targets.hdr),
             buf.as_entire_binding(),
             BindingResource::TextureView(bloom.output()),
             BindingResource::Sampler(sampler),
             sky.light_buf.as_entire_binding(),
-            BindingResource::TextureView(ssao.output()),
+            BindingResource::TextureView(gi.output()),
             exposure.state.as_entire_binding(),
+            BindingResource::TextureView(gi.contact()),
+            BindingResource::TextureView(&targets.aux),
         ],
     )
 }
@@ -505,9 +541,12 @@ impl Renderer {
                 texture_entry(12, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
                 texture_entry(13, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D3),
                 texture_entry(14, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D3),
+                texture_entry(15, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
+                texture_entry(16, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D3),
             ],
         );
         let clouds = Clouds::new(device, queue, &global_bgl, width, height);
+        let height_shadow = HeightShadow::new(device, &terrain);
         let sky = Sky::new(device, &global_bgl, &clouds.shadow_view);
         let pass_bgl = bgl(device, "pass", &[uniform_entry(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
 
@@ -582,7 +621,7 @@ impl Renderer {
             min_filter: FilterMode::Linear,
             ..Default::default()
         });
-        let make_global = |shadow_view: &TextureView, cloud_shadow: &TextureView, ap_scat: &TextureView, ap_trans: &TextureView| {
+        let make_global = |shadow_view: &TextureView, cloud_shadow: &TextureView, ap_scat: &TextureView, ap_trans: &TextureView, ap_shade: &TextureView| {
             bind_group(
                 device,
                 "global",
@@ -603,12 +642,15 @@ impl Renderer {
                     BindingResource::TextureView(cloud_shadow),
                     BindingResource::TextureView(ap_scat),
                     BindingResource::TextureView(ap_trans),
+                    BindingResource::TextureView(&height_shadow.view),
+                    BindingResource::TextureView(ap_shade),
                 ],
             )
         };
-        let global_bg = make_global(&shadow_array, &clouds.shadow_view, &sky.ap_scat_view, &sky.ap_trans_view);
+        let global_bg = make_global(&shadow_array, &clouds.shadow_view, &sky.ap_scat_view, &sky.ap_trans_view, &sky.ap_shade_view);
         // for the passes that write the sun shadow map, the cloud shadow map or the aerial volume
-        let global_bg_shadow = make_global(&dummy_view, &dummy_2d_view, &dummy_3d_view, &dummy_3d_view);
+        let global_bg_shadow = make_global(&dummy_view, &dummy_2d_view, &dummy_3d_view, &dummy_3d_view, &dummy_3d_view);
+        let global_bg_haze = make_global(&shadow_array, &clouds.shadow_view, &sky.ap_scat_view, &sky.ap_trans_view, &dummy_3d_view);
 
         let pass_bufs: Vec<Buffer> = (0..3)
             .map(|_| buffer(device, "pass", std::mem::size_of::<PassUniform>() as u64, BufferUsages::UNIFORM | BufferUsages::COPY_DST))
@@ -628,7 +670,7 @@ impl Renderer {
 
         // sky
         let module = shader(device, "sky", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/sky.wgsl")]);
-        let targets_hdr = [Some(ColorTargetState { format: HDR, blend: None, write_mask: ColorWrites::ALL })];
+        let targets_hdr = scene_targets(HDR, true);
         let sky_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("sky"),
             layout: Some(&pipeline_layout(device, &[&global_bgl, &clouds.sample_bgl])),
@@ -653,6 +695,8 @@ impl Renderer {
                 uniform_entry(4, ShaderStages::FRAGMENT),
                 texture_entry(5, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
                 storage_entry(6, ShaderStages::FRAGMENT, true),
+                texture_entry(7, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
+                texture_entry(8, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
             ],
         );
         let post_buf = buffer(device, "post", 32, BufferUsages::UNIFORM | BufferUsages::COPY_DST);
@@ -671,7 +715,7 @@ impl Renderer {
         });
         let targets = make_targets(device, width, height, msaa);
         let bloom = Bloom::new(device, HDR, &targets.hdr, width, height);
-        let ssao = Ssao::new(device, &global_bgl, &targets.depth, msaa, width, height);
+        let ssilvb = Ssilvb::new(device, &global_bgl, &targets.depth, &targets.hdr, msaa, width, height);
         let hiz = Hiz::new(device, &targets.depth, msaa, width, height);
         forest.set_hiz(device, hiz.view(), hiz.info());
         let post_sampler = device.create_sampler(&SamplerDescriptor {
@@ -681,7 +725,7 @@ impl Renderer {
             ..Default::default()
         });
         let exposure = Exposure::new(device, &targets.hdr);
-        let post_bg = post_bind_group(device, &post_bgl, &targets.hdr, &post_buf, &bloom, &post_sampler, &sky, &ssao, &exposure);
+        let post_bg = post_bind_group(device, &post_bgl, &targets, &post_buf, &bloom, &post_sampler, &sky, &ssilvb, &exposure);
 
         let readbacks = (0..3)
             .map(|_| Readback {
@@ -706,6 +750,7 @@ impl Renderer {
             frame_buf,
             global_bg,
             global_bg_shadow,
+            global_bg_haze,
             pass_bufs,
             pass_bgs,
             _shadow_tex: shadow_tex,
@@ -720,20 +765,21 @@ impl Renderer {
             post_sampler,
             sky,
             bloom,
-            ssao,
+            ssilvb,
             hiz,
             terrain,
             forest,
             grass,
             undergrowth,
             clouds,
+            height_shadow,
             timestamp_period: queue.get_timestamp_period(),
             readbacks,
             timings: Vec::new(),
             frame_index: 0,
             stats: Stats::default(),
             frozen: None,
-            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true, prepass: true, occlusion: true },
+            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssilvb: true, prepass: true, occlusion: true, debug_view: 0 },
             _leaf: leaf_tex,
             _dummies: [dummy_shadow, dummy_2d, dummy_3d],
         }
@@ -759,11 +805,11 @@ impl Renderer {
         self.targets = make_targets(device, self.width, self.height, self.msaa);
         self.clouds.resize(device, self.width, self.height);
         self.bloom.resize(device, HDR, &self.targets.hdr, self.width, self.height);
-        self.ssao.resize(device, &self.targets.depth, self.width, self.height);
+        self.ssilvb.resize(device, &self.targets.depth, &self.targets.hdr, self.width, self.height);
         self.hiz.resize(device, &self.targets.depth, self.width, self.height);
         self.forest.set_hiz(device, self.hiz.view(), self.hiz.info());
         self.exposure.set_target(device, &self.targets.hdr);
-        self.post_bg = post_bind_group(device, &self.post_bgl, &self.targets.hdr, &self.post_buf, &self.bloom, &self.post_sampler, &self.sky, &self.ssao, &self.exposure);
+        self.post_bg = post_bind_group(device, &self.post_bgl, &self.targets, &self.post_buf, &self.bloom, &self.post_sampler, &self.sky, &self.ssilvb, &self.exposure);
     }
 
     pub fn render(&mut self, device: &Device, queue: &Queue, out: &TextureView, cam: &Camera, time: f32) {
@@ -806,16 +852,17 @@ impl Renderer {
             sun_dir: sun.extend(0.0),
             sun_color: SUN_ILLUM.extend(atm.ambient),
             atmos: Vec4::new(atm.haze, atm.overcast, 0.0, 0.0),
-            fog: Vec4::new(atm.fog_density, atm.fog_falloff, 0.0, 0.0),
+            fog: Vec4::new(atm.fog_density, atm.fog_falloff, 0.0, atm.forest_haze),
             wind: Vec4::new(wind_dir.x, wind_dir.y, atm.wind, 0.0),
             screen: Vec4::new(self.width as f32, self.height as f32, 1.0 / self.width as f32, 1.0 / self.height as f32),
             world: Vec4::new(WORLD, HM_RES as f32, WORLD / HM_RES as f32, SHADOW_RES as f32),
             cascade: Vec4::new(CASCADES[0].1, CASCADES[1].1, texel0, texel1),
             lod: Vec4::new(LOD_DIST.x, LOD_DIST.y, LOD_DIST.z, MAX_TREE_DIST),
-            debug: Vec4::new(if self.settings.lod_tint { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
+            debug: Vec4::new(if self.settings.lod_tint { 1.0 } else { 0.0 }, (self.settings.debug_view == 6) as u32 as f32, 0.0, 0.0),
             clouds: Vec4::new(atm.cloud_base, atm.cloud_top, atm.cloud_cover, atm.cloud_density),
             cloud_type: Vec4::new(atm.cloud_type.0, atm.cloud_type.1, atm.wind * 9.0, 0.0),
             cloud_shadow: Clouds::shadow_params(cam.pos, sun, atm.cloud_base, atm.cloud_cover),
+            sun_grid: self.height_shadow.grid(sun),
             morph: self.terrain.morph_ranges(),
         };
         queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&fu));
@@ -828,7 +875,7 @@ impl Renderer {
             queue.write_buffer(b, 0, bytemuck::bytes_of(p));
         }
         let upscale = (self.width, self.height) != (self.out_width, self.out_height);
-        queue.write_buffer(&self.post_buf, 0, cast_slice(&[atm.exposure, BLOOM, 1.0 / self.bloom.levels() as f32, EXPOSURE_KEY, upscale as u32 as f32, 0.0, 0.0, 0.0]));
+        queue.write_buffer(&self.post_buf, 0, cast_slice(&[atm.exposure, BLOOM, 1.0 / self.bloom.levels() as f32, EXPOSURE_KEY, upscale as u32 as f32, self.settings.debug_view as f32, 0.0, 0.0]));
 
         let shadow_planes = [frustum_planes(svp0), frustum_planes(svp1)];
         self.terrain.select(queue, Vec2::new(ref_pos.x, ref_pos.z), MAX_TREE_DIST * 0.6, &[cull_planes, shadow_planes[0], shadow_planes[1]]);
@@ -841,8 +888,9 @@ impl Renderer {
             0,
             &ViewSetup { planes: pad_planes(cull_planes), ref_pos, max_dist: MAX_TREE_DIST, lod: LOD_DIST, occlusion: occlusion.then(|| (cam.view(), Vec2::new(proj.x_axis.x, proj.y_axis.y))) },
         );
-        // what each cascade shades (shadow_at in globals.wgsl): the near one up to its far
-        // distance, the far one from where the blend between them starts
+        // what each cascade shades (shadow_at in globals.wgsl, and the haze in aerial_near in
+        // aerial.wgsl): the near one up to its far distance, the far one from where the blend
+        // between them starts
         let receivers = [(0.0, CASCADES[0].1), (0.8 * CASCADES[0].1, CASCADES[1].1)];
         for (i, planes) in shadow_planes.iter().enumerate() {
             let mut lod = LOD_DIST;
@@ -860,10 +908,10 @@ impl Renderer {
         let slot = (self.frame_index % self.readbacks.len() as u64) as usize;
         let staged = !self.readbacks[slot].pending && self.readbacks[slot].state.load(Ordering::Acquire) == 0;
         let qs = if staged { self.readbacks[slot].queries.clone() } else { None };
-        let written = match (&qs, self.settings.ssao) {
+        let written = match (&qs, self.settings.ssilvb) {
             (None, _) => 0,
             (Some(_), true) => (1 << TIMESTAMPS) - 1,
-            (Some(_), false) => ((1 << TIMESTAMPS) - 1) & !(1 << TS_SSAO),
+            (Some(_), false) => ((1 << TIMESTAMPS) - 1) & !(1 << TS_GI),
         };
         let pass_end = |i: u32| qs.as_ref().map(|q| RenderPassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(i) });
 
@@ -880,10 +928,7 @@ impl Renderer {
                 self.undergrowth.generate(&mut cp, &self.global_bg);
             }
         }
-        let (view, resolve) = match &self.targets.color_msaa {
-            Some(m) => (m, Some(&self.targets.hdr)),
-            None => (&self.targets.hdr, None),
-        };
+        let scene = self.targets.scene();
         if occlusion {
             // Under the canopy almost every distant tree is hidden behind the near ones, yet
             // they are most of the triangles. So the terrain and the near trees lay down their
@@ -893,13 +938,10 @@ impl Renderer {
             // GPU can overlap them with it instead of the main pass waiting on it.
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("occluders"),
-                // only there for the leaves' alpha-to-coverage: nothing is written to it
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Discard },
-                })],
+                // only there for the leaves' alpha-to-coverage: nothing is written to them
+                color_attachments: &scene.map(|(view, _)| {
+                    Some(RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Discard } })
+                }),
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &self.targets.depth,
                     depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
@@ -922,7 +964,9 @@ impl Renderer {
             self.hiz.build(&mut cp);
             self.forest.cull_occluded(&mut cp, &self.global_bg_shadow);
         }
-        // the atmosphere tables; timed together with the clouds
+        // the terrain's shadow over the whole world when the sun has moved, and the atmosphere
+        // tables; timed together with the clouds
+        self.height_shadow.update(queue, &mut enc, sun);
         let sky_params = SkyParams { sun_dir: sun, sun_illum: SUN_ILLUM, haze: atm.haze, cam_alt_m: cam.pos.y, overcast: atm.overcast, ground_albedo: 0.12, fog: fu.fog };
         self.sky.update(queue, &mut enc, &sky_params);
         {
@@ -941,7 +985,7 @@ impl Renderer {
                     depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: if c == 1 { pass_end(TS_SHADOWS) } else { None },
+                timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -952,14 +996,22 @@ impl Renderer {
             self.forest.draw(&mut rp, 1 + c, TreePass::Shadow, 0..LODS);
         }
         {
+            // the haze in the trees' shadows; timed with the shadows
+            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(TS_SHADOWS) });
+            let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("shadowed haze"), timestamp_writes: tw });
+            self.sky.aerial_near(&mut cp, &self.global_bg_haze);
+        }
+        {
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("main"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: resolve,
-                    ops: Operations { load: LoadOp::Clear(Color::BLACK), store: if resolve.is_some() { StoreOp::Discard } else { StoreOp::Store } },
-                })],
+                color_attachments: &scene.map(|(view, resolve_target)| {
+                    Some(RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target,
+                        ops: Operations { load: LoadOp::Clear(Color::TRANSPARENT), store: if resolve_target.is_some() { StoreOp::Discard } else { StoreOp::Store } },
+                    })
+                }),
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
                     view: &self.targets.depth,
                     depth_ops: Some(Operations { load: if occlusion { LoadOp::Load } else { LoadOp::Clear(0.0) }, store: StoreOp::Store }),
@@ -996,11 +1048,11 @@ impl Renderer {
             rp.set_bind_group(1, self.clouds.output(), &[]);
             rp.draw(0..3, 0..1);
         }
-        if self.settings.ssao {
-            self.ssao.record(&mut enc, &self.global_bg, pass_end(TS_SSAO));
+        if self.settings.ssilvb {
+            self.ssilvb.record(&mut enc, &self.global_bg, pass_end(TS_GI));
         } else {
             // not timed: it draws nothing, and an empty pass may not take a timestamp on Metal
-            self.ssao.clear(&mut enc);
+            self.ssilvb.clear(&mut enc);
         }
         self.bloom.record(&mut enc, pass_end(TS_BLOOM));
         self.exposure.record(queue, &mut enc, time);
@@ -1025,7 +1077,7 @@ impl Renderer {
 
         // This frame's counts are copied now, but its timestamps are resolved by the next
         // frame. Resolved in the frame's own command buffer, the timestamps of the last
-        // passes (SSAO, bloom, post) came back stale on Metal, probably because the resolve
+        // passes (SSILVB, bloom, post) came back stale on Metal, probably because the resolve
         // does not wait for those passes to write them. A frame later they are final: that
         // frame's main pass overwrites the image those passes read, so it runs after them,
         // and in capture mode the GPU is idle between frames anyway.
@@ -1186,12 +1238,12 @@ mod tests {
     }
 
     #[test]
-    fn untimed_ssao_counts_with_bloom() {
+    fn untimed_ssilvb_counts_with_bloom() {
         let mut ts = IN_ORDER;
-        ts[TS_SSAO as usize] = 3; // not written this frame
-        let t = GpuTiming::parse(0, &ts, ALL & !(1 << TS_SSAO), PERIOD).unwrap();
+        ts[TS_GI as usize] = 3; // not written this frame
+        let t = GpuTiming::parse(0, &ts, ALL & !(1 << TS_GI), PERIOD).unwrap();
         assert!(t.ordered);
-        assert_eq!(t.sections[TS_SSAO as usize - 1], None);
+        assert_eq!(t.sections[TS_GI as usize - 1], None);
         assert!(close(t.sections[TS_BLOOM as usize - 1], 0.15));
         assert!(close(Some(t.total_ms), 1.8));
     }
@@ -1208,9 +1260,9 @@ mod tests {
 
     #[test]
     fn overlapping_passes_are_flagged_but_still_add_up() {
-        // SSAO finishes after bloom (they don't depend on each other)
+        // SSILVB finishes after bloom (they don't depend on each other)
         let mut ts = IN_ORDER;
-        ts[TS_SSAO as usize] = 11_760;
+        ts[TS_GI as usize] = 11_760;
         let t = GpuTiming::parse(0, &ts, ALL, PERIOD).unwrap();
         assert!(!t.ordered);
         assert!(close(t.sections[TS_BLOOM as usize - 1], 0.0));

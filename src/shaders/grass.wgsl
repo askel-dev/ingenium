@@ -49,7 +49,7 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOu
 }
 
 @fragment
-fn fs(in: VOut) -> @location(0) vec4f {
+fn fs(in: VOut) -> SceneOut {
     let t = in.misc.x;
     let flower = in.misc.y;
     let rnd = in.misc.z;
@@ -70,7 +70,6 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let wrap = max((dot(n, L) + 0.4) / 1.4, 0.0);
     let trans = pow(max(dot(-V, L), 0.0), 4.0) * 0.5 * t;
     let ao = mix(0.2, 1.0, t * t);
-    var col = albedo * (sun_light(in.wp) * (wrap + trans) * sh * ao + ambient(n, in.wp) * ao);
-    col = apply_fog(col, in.wp);
-    return vec4f(col, 1.0);
+    let direct = albedo * sun_light(in.wp) * (wrap + trans) * sh * ao;
+    return scene_out(direct + albedo * ambient(n, in.wp) * ao, direct, albedo, in.wp, 1.0);
 }

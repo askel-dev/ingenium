@@ -8,6 +8,17 @@ pub const ATMO_WGSL: &str = include_str!("shaders/atmo_common.wgsl");
 /// The per-frame globals; they read the atmosphere tables, so they bring the atmosphere code along.
 pub const GLOBALS_WGSL: &str = concat!(include_str!("shaders/atmo_common.wgsl"), include_str!("shaders/globals.wgsl"));
 
+/// The main pass's second colour target: each pixel's diffuse albedo, and the share of its
+/// light that came straight from the sun, for the screen-space lighting after it (ssilvb.wgsl).
+pub const AUX: TextureFormat = TextureFormat::Rgba8Unorm;
+
+/// The colour targets of the main pass and of the occluder pass before it: the HDR colour and
+/// the aux target. `write` false for the depth-only pipelines.
+pub fn scene_targets(hdr: TextureFormat, write: bool) -> [Option<ColorTargetState>; 2] {
+    let write_mask = if write { ColorWrites::ALL } else { ColorWrites::empty() };
+    [Some(ColorTargetState { format: hdr, blend: None, write_mask }), Some(ColorTargetState { format: AUX, blend: None, write_mask })]
+}
+
 pub fn uniform_entry(binding: u32, visibility: ShaderStages) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {
         binding,

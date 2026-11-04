@@ -1,7 +1,7 @@
 //! ingenium: a small GPU-driven forest renderer.
 //!
 //!   cargo run --release                       window, cinematic flythrough
-//!   cargo run --release -- --capture out.png  headless screenshot (+ --time, --size, --atmos, --cam, --no-ao)
+//!   cargo run --release -- --capture out.png  headless screenshot (+ --time, --size, --atmos, --cam, --no-gi)
 
 mod bloom;
 mod camera;
@@ -10,6 +10,7 @@ mod exposure;
 mod forest;
 mod gpu;
 mod grass;
+mod height_shadow;
 mod hiz;
 mod hud;
 mod impostor;
@@ -17,7 +18,7 @@ mod leaftex;
 mod player;
 mod renderer;
 mod sky;
-mod ssao;
+mod ssilvb;
 mod terrain;
 mod treegen;
 mod undergrowth;
@@ -61,12 +62,13 @@ struct Args {
     msaa: u32,
     vsync: bool,
     lod_tint: bool,
-    ssao: bool,
+    ssilvb: bool,
     hud: bool,
     /// Render scale; None in a window means one scene pixel per point (half on Retina).
     scale: Option<f32>,
     prepass: bool,
     occlusion: bool,
+    debug_view: u32,
     leaf_png: Option<String>,
     impostor_png: Option<String>,
 }
@@ -84,11 +86,12 @@ fn parse_args() -> Args {
         msaa: 4,
         vsync: true,
         lod_tint: false,
-        ssao: true,
+        ssilvb: true,
         hud: false,
         scale: None,
         prepass: true,
         occlusion: true,
+        debug_view: 0,
         leaf_png: None,
         impostor_png: None,
     };
@@ -120,10 +123,11 @@ fn parse_args() -> Args {
             }
             "--novsync" => a.vsync = false,
             "--lod-tint" => a.lod_tint = true,
-            "--no-ao" => a.ssao = false,
+            "--no-gi" | "--no-ao" => a.ssilvb = false,
             "--hud" => a.hud = true,
             "--no-prepass" => a.prepass = false,
             "--no-occlusion" => a.occlusion = false,
+            "--debug-view" => { a.debug_view = next(i).parse().unwrap_or(0); i += 1; }
             "--scale" => { a.scale = next(i).parse().ok(); i += 1; }
             "--leaf-png" => { a.leaf_png = Some(next(i)); i += 1; }
             "--impostor-png" => { a.impostor_png = Some(next(i)); i += 1; }
@@ -149,7 +153,7 @@ fn main() {
         "controls: Tab cinematic/player · click to grab mouse, Esc to release · V walk/fly\n\
          \x20 walk:    WASD move, Space jump, Shift sprint, Ctrl/C crouch\n\
          \x20 fly:     WASD move, Space/E up, Q/C down, Shift fast, Ctrl slow\n\
-         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · G grass · H stats overlay · -/= render scale · F11 fullscreen · P print camera"
+         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · G grass · O screen-space lighting · H stats overlay · -/= render scale · F11 fullscreen · P print camera"
     );
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App { args, state: None };
@@ -164,9 +168,10 @@ fn capture(args: &Args) {
     r.settings.atmos = args.atmos;
     r.settings.sun_shift = args.sun_shift;
     r.settings.lod_tint = args.lod_tint;
-    r.settings.ssao = args.ssao;
+    r.settings.ssilvb = args.ssilvb;
     r.settings.prepass = args.prepass;
     r.settings.occlusion = args.occlusion;
+    r.settings.debug_view = args.debug_view;
     if let Some(s) = args.scale {
         r.set_scale(&gpu.device, s);
     }
@@ -365,9 +370,10 @@ impl App {
         renderer.settings.atmos = self.args.atmos;
         renderer.settings.sun_shift = self.args.sun_shift;
         renderer.settings.lod_tint = self.args.lod_tint;
-        renderer.settings.ssao = self.args.ssao;
+        renderer.settings.ssilvb = self.args.ssilvb;
         renderer.settings.prepass = self.args.prepass;
         renderer.settings.occlusion = self.args.occlusion;
+        renderer.settings.debug_view = self.args.debug_view;
         renderer.set_scale(&gpu.device, self.args.scale.unwrap_or(1.0 / window.scale_factor() as f32));
         let hud = hud::Hud::new(&gpu.device, format);
         let path = FlyPath::new(&renderer.terrain);
@@ -495,7 +501,7 @@ impl State {
                 self.window.set_fullscreen(if full { None } else { Some(winit::window::Fullscreen::Borderless(None)) });
             }
             KeyCode::KeyG => s.grass = !s.grass,
-            KeyCode::KeyO => s.ssao = !s.ssao,
+            KeyCode::KeyO => s.ssilvb = !s.ssilvb,
             KeyCode::KeyH => self.hud.visible = !self.hud.visible,
             KeyCode::Minus | KeyCode::Equal => {
                 const STEPS: [f32; 6] = [0.5, 0.6, 0.67, 0.75, 0.85, 1.0];

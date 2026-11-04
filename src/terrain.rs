@@ -218,8 +218,7 @@ impl Terrain {
         let vbl = VertexBufferLayout { array_stride: 16, step_mode: VertexStepMode::Instance, attributes: &attrs };
         // the camera's colour pass, its depth-only occluder pass, or a shadow cascade
         let make = |shadow: bool, depth_only: bool| {
-            let mask = if depth_only { ColorWrites::empty() } else { ColorWrites::ALL };
-            let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: mask })];
+            let targets = scene_targets(hdr, !depth_only);
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(if shadow { "terrain shadow" } else if depth_only { "terrain depth" } else { "terrain" }),
                 layout: Some(&layout),
@@ -254,7 +253,7 @@ impl Terrain {
         self.pipe_depth = Some(make(false, true));
         self.pipe_shadow = Some(make(true, false));
 
-        let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::ALL })];
+        let targets = scene_targets(hdr, true);
         self.pipe_canopy = Some(device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("canopy shell"),
             layout: Some(&layout),

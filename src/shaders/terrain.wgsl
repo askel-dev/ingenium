@@ -167,7 +167,7 @@ fn litter(p: vec2f, fp: f32) -> Litter {
 fn fs_depth() {}
 
 @fragment
-fn fs(in: VOut) -> @location(0) vec4f {
+fn fs(in: VOut) -> SceneOut {
     let p = in.wp.xz;
     let dat = data_at(p);
     let dist = distance(in.wp, F.cam_pos.xyz);
@@ -237,9 +237,8 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
     let L = F.sun_dir.xyz;
     let ndl = max(dot(n, L), 0.0);
-    let sh = shadow_at(in.wp, n);
-    // far away there is no shadow map: darken dense forest floor instead
-    let canopy = mix(1.0, 0.35, smoothstep(0.45, 0.85, forest) * smoothstep(F.cascade.y * 0.6, F.cascade.y, dist));
+    // beyond the cascades the terrain shadow map shades it, the forest canopy included
+    let sh = shadow_ground(in.wp, n);
 
     // A grass sward is not a flat surface: looking down into it you see the dark gaps
     // between blades, at a grazing angle only lit blade sides; with the sun behind you
@@ -250,13 +249,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let hot = exp(-(1.0 - vl) * 18.0) * 0.35;
     let back = pow(saturate(-vl), 6.0) * 0.4 * smoothstep(0.0, 0.2, L.y);
     let sward_look = mix(1.0, grazing, grassy);
-    let direct = sun_light(in.wp) * sh * canopy * (ndl * (1.0 + hot * grassy) + back * grassy);
+    let direct = sun_light(in.wp) * sh * (ndl * (1.0 + hot * grassy) + back * grassy);
     let amb = ambient_vis(n, in.wp, vis);
     // blades are a little glossy: at a grazing angle the sward picks up a sheen of sky
     let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * 0.05 * pow(1.0 - ndv, 4.0) * grassy;
-    var col = albedo * sward_look * (direct + amb) + sheen;
-    col = apply_fog(col, in.wp);
-    return vec4f(col, 1.0);
+    let diffuse = albedo * sward_look;
+    return scene_out(diffuse * (direct + amb) + sheen, diffuse * direct, diffuse, in.wp, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +297,7 @@ fn vs_canopy(@builtin(vertex_index) vid: u32, @location(0) quad: vec4f) -> Canop
 }
 
 @fragment
-fn fs_canopy(in: CanopyOut) -> @location(0) vec4f {
+fn fs_canopy(in: CanopyOut) -> SceneOut {
     let p = in.wp.xz;
     let dat = data_at(p);
     let dist = distance(in.wp, F.cam_pos.xyz);
@@ -330,7 +328,8 @@ fn fs_canopy(in: CanopyOut) -> @location(0) vec4f {
     // the canopy top sees about the sky the bare terrain would (the bake counts the canopy
     // itself as blocking, which is right only for the floor beneath it)
     let vis = mix(sky_vis(p), 1.0, 0.75);
-    var col = albedo * (sun_light(in.wp) * wrap * mix(0.45, 1.0, gap) + ambient_vis(n, in.wp, vis) * mix(0.5, 1.0, gap));
-    col = apply_fog(col, in.wp);
-    return vec4f(col, alpha);
+    // shaded by the mountains towards the sun (the shell is the canopy itself, so not by it)
+    let sun = sun_light(in.wp) * sun_height_vis(in.wp).x;
+    let direct = albedo * sun * wrap * mix(0.45, 1.0, gap);
+    return scene_out(direct + albedo * ambient_vis(n, in.wp, vis) * mix(0.5, 1.0, gap), direct, albedo, in.wp, alpha);
 }

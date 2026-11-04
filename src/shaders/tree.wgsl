@@ -59,17 +59,28 @@ fn tree_tint(seed: u32, stand: f32) -> vec3f {
     return mix(tint, tint * vec3f(1.55, 1.2, 0.5), smoothstep(0.93, 1.0, r3) * 0.75);
 }
 
+// Light leaving a surface (before the haze), and the part of it that came straight from the sun.
+struct Lit {
+    col: vec3f,
+    direct: vec3f,
+}
+
+fn mix_lit(a: Lit, b: Lit, t: f32) -> Lit {
+    return Lit(mix(a.col, b.col, t), mix(a.direct, b.direct, t));
+}
+
 // Leaves: wrapped diffuse light, light through the leaves from behind, a soft waxy highlight
 // and a sky sheen. `sun_vis` is the share of the sunlight that gets to them, `card` 1 for leaf
 // cards and 0 for the spruce's inner cone (opaque, no light through it).
-fn shade_leaves(albedo: vec3f, n: vec3f, wp: vec3f, vis: f32, sun_vis: f32, ao: f32, card: f32) -> vec3f {
+fn shade_leaves(albedo: vec3f, n: vec3f, wp: vec3f, vis: f32, sun_vis: f32, ao: f32, card: f32) -> Lit {
     let L = F.sun_dir.xyz;
     let V = normalize(F.cam_pos.xyz - wp);
     let sun = sun_light(wp);
     let amb = ambient_vis(n, wp, vis);
     let wrap = max((dot(n, L) + 0.45) / 1.45, 0.0);
     let trans = pow(max(dot(-V, L), 0.0), 5.0) * 0.3;
-    var col = albedo * (sun * (wrap * 0.95 + trans) * sun_vis * mix(0.45, 1.0, ao) + amb * ao);
+    var direct = albedo * sun * (wrap * 0.95 + trans) * sun_vis * mix(0.45, 1.0, ao);
+    var col = direct + albedo * amb * ao;
     // Leaves are waxy: a soft, broad highlight from the sun (the normals are rounded over the
     // crown and its clumps, so it lands where they face between sun and eye) and a sky sheen at
     // grazing angles. Uncoloured, as on any dielectric. (a rough surface: the Fresnel rise
@@ -79,17 +90,20 @@ fn shade_leaves(albedo: vec3f, n: vec3f, wp: vec3f, vis: f32, sun_vis: f32, ao: 
     let fres = 0.04 + 0.16 * pow(1.0 - ndv, 4.0);
     let spec = pow(max(dot(n, H), 0.0), 12.0) * fres * max(dot(n, L), 0.0);
     let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * fres * 0.35;
-    col += (sun * spec * sun_vis + sheen * ao) * mix(0.5, 1.0, card);
+    let gloss = mix(0.5, 1.0, card);
+    direct += sun * spec * sun_vis * gloss;
+    col += (sun * spec * sun_vis + sheen * ao) * gloss;
     // Leaves are thin: light falling on one side comes out of the other, yellower. The normals
     // point outwards, so the leaves under a crown glow with the sun and sky on their upper side,
     // as a canopy does seen from below.
-    let tcol = albedo * vec3f(1.15, 1.2, 0.55);
-    let through = sun * max(dot(-n, L), 0.0) * sun_vis * 0.5 + ambient_vis(-n, wp, vis) * ao * 0.6;
-    return col + tcol * through * card;
+    let tcol = albedo * vec3f(1.15, 1.2, 0.55) * card;
+    let sun_through = tcol * sun * max(dot(-n, L), 0.0) * sun_vis * 0.5;
+    return Lit(col + sun_through + tcol * ambient_vis(-n, wp, vis) * ao * 0.6, direct + sun_through);
 }
 
-fn shade_bark(albedo: vec3f, n: vec3f, wp: vec3f, vis: f32, sun_vis: f32, ao: f32) -> vec3f {
-    return albedo * (sun_light(wp) * max(dot(n, F.sun_dir.xyz), 0.0) * sun_vis + ambient_vis(n, wp, vis) * ao);
+fn shade_bark(albedo: vec3f, n: vec3f, wp: vec3f, vis: f32, sun_vis: f32, ao: f32) -> Lit {
+    let direct = albedo * sun_light(wp) * max(dot(n, F.sun_dir.xyz), 0.0) * sun_vis;
+    return Lit(direct + albedo * ambient_vis(n, wp, vis) * ao, direct);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +160,7 @@ fn vs(v: VIn) -> VOut {
 }
 
 @fragment
-fn fs(in: VOut) -> @location(0) vec4f {
+fn fs(in: VOut) -> SceneOut {
     let tex = textureSample(t_leaf, s_repeat, in.uv, i32(in.info.x));
     let aw = max(fwidth(tex.a), 1e-4);
     let species = in.info.x;
@@ -182,17 +196,16 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // the baked sky visibility is for the ground: up in the crown much more of the sky is open
     let up = saturate(in.misc.z / 12.0);
     let vis = mix(sky_vis(in.wp.xz), 1.0, select(up * 0.85, 0.75, kind == 2u));
-    var col: vec3f;
+    var lit: Lit;
     if (kind == 0u) {
-        col = shade_bark(albedo, n, in.wp, vis, sh, ao);
+        lit = shade_bark(albedo, n, in.wp, vis, sh, ao);
     } else {
-        col = shade_leaves(albedo, n, in.wp, vis, sh * in.own.x, ao, select(0.0, 1.0, kind == 1u));
+        lit = shade_leaves(albedo, n, in.wp, vis, sh * in.own.x, ao, select(0.0, 1.0, kind == 1u));
     }
     if (F.debug.x > 0.5) {
-        col = mix(col, lod_tint(in.info.w) * 0.3, 0.6);
+        lit.col = mix(lit.col, lod_tint(in.info.w) * 0.3, 0.6);
     }
-    col = apply_fog(col, in.wp);
-    return vec4f(col, alpha);
+    return scene_out(lit.col, lit.direct, albedo, in.wp, alpha);
 }
 
 // Leaf coverage, as `fs` computes it: the alpha edge sharpened to about a pixel wide.
@@ -384,7 +397,7 @@ fn imp_dither(frag: vec4f) -> f32 {
 }
 
 @fragment
-fn fs_impostor(in: IOut) -> @location(0) vec4f {
+fn fs_impostor(in: IOut) -> SceneOut {
     let g = imp_gather(in, true);
     let s = SHAPES[in.info.y];
     let scale = in.dir.w;
@@ -403,12 +416,11 @@ fn fs_impostor(in: IOut) -> @location(0) vec4f {
     let lift = max(dot(center - wp, L), 0.0) + 1.0;
     let sun_vis = shadow_at(wp + L * lift, n) * crown_light(p, unrot_y(L, in.cs), s, scale);
     let vis = mix(sky_vis(wp.xz), 1.0, saturate(p.y / 12.0) * 0.85);
-    var col = mix(shade_bark(albedo, n, wp, vis, sun_vis, g.ao), shade_leaves(albedo, n, wp, vis, sun_vis, g.ao, 1.0), leaf);
+    var lit = mix_lit(shade_bark(albedo, n, wp, vis, sun_vis, g.ao), shade_leaves(albedo, n, wp, vis, sun_vis, g.ao, 1.0), leaf);
     if (F.debug.x > 0.5) {
-        col = mix(col, lod_tint(in.info.w) * 0.3, 0.6);
+        lit.col = mix(lit.col, lod_tint(in.info.w) * 0.3, 0.6);
     }
-    col = apply_fog(col, wp);
-    return vec4f(col, imp_coverage(g));
+    return scene_out(lit.col, lit.direct, albedo, wp, imp_coverage(g));
 }
 
 // The depth prepass with MSAA (alpha-to-coverage).

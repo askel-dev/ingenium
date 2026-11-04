@@ -16,6 +16,8 @@ const SKYVIEW: (u32, u32) = (192, 108);
 const SKY_OUT: u64 = 64;
 /// Aerial perspective froxels: across, down, depth slices (AP_DIST in globals.wgsl).
 const AERIAL: (u32, u32, u32) = (64, 64, 32);
+/// The shadowed haze near the camera: across, down, depth slices over NEAR_DIST (globals.wgsl).
+const NEAR: (u32, u32, u32) = (160, 90, 64);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -53,6 +55,10 @@ pub struct Sky {
     pub ap_trans_view: TextureView,
     ap_pipe: ComputePipeline,
     ap_bg: BindGroup,
+    /// The sunlight the shadows take out of the haze near the camera (`aerial_near`).
+    pub ap_shade_view: TextureView,
+    near_pipe: ComputePipeline,
+    near_bg: BindGroup,
     built_for: Option<(f32, f32)>,
 }
 
@@ -69,10 +75,10 @@ fn lut(device: &Device, label: &str, w: u32, h: u32) -> Texture {
     })
 }
 
-fn volume(device: &Device, label: &str) -> Texture {
+fn volume(device: &Device, label: &str, (w, h, d): (u32, u32, u32)) -> Texture {
     device.create_texture(&TextureDescriptor {
         label: Some(label),
-        size: Extent3d { width: AERIAL.0, height: AERIAL.1, depth_or_array_layers: AERIAL.2 },
+        size: Extent3d { width: w, height: h, depth_or_array_layers: d },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D3,
@@ -124,8 +130,10 @@ impl Sky {
             device.create_bind_group(&BindGroupDescriptor { label: Some("atmosphere"), layout: &pipes[i].get_bind_group_layout(0), entries: &e })
         });
 
-        let (ap_scat, ap_trans) = (volume(device, "aerial scattering"), volume(device, "aerial transmittance"));
+        let (ap_scat, ap_trans) = (volume(device, "aerial scattering", AERIAL), volume(device, "aerial transmittance", AERIAL));
         let (ap_scat_view, ap_trans_view) = (ap_scat.create_view(&Default::default()), ap_trans.create_view(&Default::default()));
+        let ap_shade = volume(device, "aerial shade", NEAR);
+        let ap_shade_view = ap_shade.create_view(&Default::default());
         let cs = ShaderStages::COMPUTE;
         let float = TextureSampleType::Float { filterable: true };
         let storage_3d = |binding| BindGroupLayoutEntry {
@@ -142,8 +150,11 @@ impl Sky {
         let ap_module = shader(device, "aerial", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/aerial.wgsl")]);
         let ap_pipe = compute_pipeline(device, "aerial", &pipeline_layout(device, &[global_bgl, &ap_bgl]), &ap_module, "aerial");
         let ap_bg = bind_group(device, "aerial", &ap_bgl, &[tex(&ms_view), tex(cloud_shadow), tex(&ap_scat_view), tex(&ap_trans_view)]);
+        let near_bgl = bgl(device, "aerial near", &[storage_3d(4)]);
+        let near_pipe = compute_pipeline(device, "aerial near", &pipeline_layout(device, &[global_bgl, &near_bgl]), &ap_module, "aerial_near");
+        let near_bg = device.create_bind_group(&BindGroupDescriptor { label: Some("aerial near"), layout: &near_bgl, entries: &[BindGroupEntry { binding: 4, resource: tex(&ap_shade_view) }] });
         Sky {
-            _textures: vec![trans, ms, sky, ap_scat, ap_trans],
+            _textures: vec![trans, ms, sky, ap_scat, ap_trans, ap_shade],
             trans_view,
             sky_view,
             uniform,
@@ -155,6 +166,9 @@ impl Sky {
             ap_trans_view,
             ap_pipe,
             ap_bg,
+            ap_shade_view,
+            near_pipe,
+            near_bg,
             built_for: None,
         }
     }
@@ -194,5 +208,14 @@ impl Sky {
         cp.set_bind_group(0, global_bg, &[]);
         cp.set_bind_group(1, &self.ap_bg, &[]);
         cp.dispatch_workgroups(AERIAL.0.div_ceil(8), AERIAL.1.div_ceil(8), 1);
+    }
+
+    /// Rebuild the shadowed haze near the camera. Run after the shadow maps; `global_bg` must
+    /// hold them, but not the volume itself.
+    pub fn aerial_near(&self, cp: &mut ComputePass, global_bg: &BindGroup) {
+        cp.set_pipeline(&self.near_pipe);
+        cp.set_bind_group(0, global_bg, &[]);
+        cp.set_bind_group(1, &self.near_bg, &[]);
+        cp.dispatch_workgroups(NEAR.0.div_ceil(8), NEAR.1.div_ceil(8), 1);
     }
 }

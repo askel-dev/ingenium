@@ -9,16 +9,17 @@ struct Frame {
     sun_dir: vec4f,      // xyz towards the sun
     sun_color: vec4f,    // rgb sun illuminance above the atmosphere, w = ambient strength
     atmos: vec4f,        // x haze (aerosol density scale), y overcast 0..1
-    fog: vec4f,          // x density, y height falloff, z base height
+    fog: vec4f,          // x density, y height falloff, z base height, w haze among the trees (per m)
     wind: vec4f,         // xy direction, z strength
     screen: vec4f,       // width, height, 1/width, 1/height
     world: vec4f,        // world size, heightmap res, texel size, shadow map res
     cascade: vec4f,      // split0, split1, texel0 (m), texel1 (m)
     lod: vec4f,          // tree LOD distances
-    debug: vec4f,        // x = LOD tint
+    debug: vec4f,        // x = LOD tint, y = show the shadowed share of the haze
     clouds: vec4f,       // x base altitude, y top altitude, z coverage, w density
     cloud_type: vec4f,   // x, y range of cloud type (0 stratus .. 1 cumulus), z drift speed (m/s)
     cloud_shadow: vec4f, // cloud shadow map: xy centre (m), z 1 / extent, w value beyond the map
+    sun_grid: vec4f,     // terrain shadow map (sun_height.wgsl): xy towards the sun, z tan(elevation), w extent (m)
     morph: array<vec4f, 12>,
 }
 
@@ -37,10 +38,33 @@ struct Frame {
 @group(0) @binding(12) var t_cloud_shadow: texture_2d<f32>;
 @group(0) @binding(13) var t_ap_scat: texture_3d<f32>;
 @group(0) @binding(14) var t_ap_trans: texture_3d<f32>;
+@group(0) @binding(15) var t_sun_h: texture_2d<f32>;
+@group(0) @binding(16) var t_ap_shade: texture_3d<f32>;
 
 // Aerial perspective volume (aerial.wgsl): froxels over the screen, slice i at distance
 // AP_DIST * ((i + 0.5) / slices)^2, so the near slices are finer.
 const AP_DIST: f32 = 16000.0;
+// The shadowed haze near the camera (aerial_near in aerial.wgsl): a finer froxel grid over the
+// first NEAR_DIST metres, laid out the same way, holding the sunlight the shadows take out of
+// the haze in front of each depth. The coarse volume leaves the sun's shadow out over most of
+// this distance, and takes the terrain's over from there on.
+const NEAR_DIST: f32 = 200.0;
+
+// Haze among the trees (per km): in the forest, below the crowns (forest_haze in renderer.rs).
+fn forest_haze_km(wp: vec3f) -> f32 {
+    if (F.fog.w <= 0.0 || any(wp.xz < vec2f(0.0)) || any(wp.xz > vec2f(F.world.x))) {
+        return 0.0;
+    }
+    let forest = smoothstep(0.3, 0.55, data_at(wp.xz).x);
+    let above = wp.y - height_at(wp.xz);
+    return F.fog.w * 1000.0 * forest * (1.0 - smoothstep(10.0, 22.0, above));
+}
+
+// How much the coarse aerial volume shadows its sunlight at distance t along a view ray; the
+// near volume handles the rest.
+fn ap_far_shadow(t: f32) -> f32 {
+    return smoothstep(NEAR_DIST * 0.75, NEAR_DIST, t);
+}
 // Below this sun height the cloud shadow map stops stretching with the sun (it would get
 // infinitely long); the sun is nearly gone by then anyway.
 const CLOUD_SHADOW_MIN_MU: f32 = 0.1;
@@ -181,7 +205,7 @@ fn ambient_vis(n: vec3f, wp: vec3f, vis: f32) -> vec3f {
 
 // Share of the light falling on a canopy that comes out underneath, through and between the
 // leaves (green: leaves pass green and absorb the rest).
-const CANOPY_TRANSMIT: vec3f = vec3f(0.07, 0.13, 0.03);
+const CANOPY_TRANSMIT: vec3f = vec3f(0.05, 0.09, 0.021);
 
 fn ambient(n: vec3f, wp: vec3f) -> vec3f {
     return ambient_vis(n, wp, sky_vis(wp.xz));
@@ -196,7 +220,44 @@ fn apply_fog(col: vec3f, wp: vec3f) -> vec3f {
     let c = vec3f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, w);
     let scat = textureSampleLevel(t_ap_scat, s_clamp, c, 0.0).rgb;
     let trans = textureSampleLevel(t_ap_trans, s_clamp, c, 0.0).rgb;
-    return col * trans + scat;
+    // less where the air near the camera lies in shadow: dark between the light shafts
+    let shade = ap_shade(c.xy, distance(wp, F.cam_pos.xyz));
+    if (F.debug.y > 0.5) {
+        // --debug-view 6: the share of the haze in front that lies in shadow, and the haze
+        return vec3f(luma(shade) / max(luma(scat), 1e-6), luma(scat) * 10.0, 0.0);
+    }
+    return col * trans + max(scat - shade, vec3f(0.0));
+}
+
+// The sunlit haze the shadows take away between the camera and distance d, at screen uv (rgb),
+// and the share of it that is not the haze among the trees (a).
+fn ap_shade_full(uv: vec2f, d: f32) -> vec4f {
+    return textureSampleLevel(t_ap_shade, s_clamp, vec3f(uv, sqrt(saturate(d / NEAR_DIST))), 0.0);
+}
+
+fn ap_shade(uv: vec2f, d: f32) -> vec3f {
+    return ap_shade_full(uv, d).rgb;
+}
+
+fn luma(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// What the main pass writes: the colour, and for the screen-space lighting after it
+// (ssilvb.wgsl) the surface's diffuse albedo and the share of its light that came straight
+// from the sun (the part that contact shadows take away; the rest is what the indirect light
+// and its occlusion apply to).
+struct SceneOut {
+    @location(0) color: vec4f,
+    @location(1) aux: vec4f,
+}
+
+// `lit` is the light leaving the surface before the haze, `direct` the part of it the sun lit.
+fn scene_out(lit: vec3f, direct: vec3f, albedo: vec3f, wp: vec3f, alpha: f32) -> SceneOut {
+    var o: SceneOut;
+    o.color = vec4f(apply_fog(lit, wp), alpha);
+    o.aux = vec4f(saturate(albedo), saturate(luma(direct) / max(luma(lit), 1e-6)));
+    return o;
 }
 
 fn shadow_sample(ci: i32, wp: vec3f) -> f32 {
@@ -215,18 +276,70 @@ fn shadow_sample(ci: i32, wp: vec3f) -> f32 {
     return s / 9.0;
 }
 
-fn shadow_at(wp: vec3f, n: vec3f) -> f32 {
+// The shadow cascades at wp (x), and how much they count there (y): 1 inside them, fading to 0
+// towards the far end of the far one.
+fn cascade_shadow(wp: vec3f, n: vec3f) -> vec2f {
     let d = distance(wp, F.cam_pos.xyz);
     if (d < F.cascade.x) {
         let s0 = shadow_sample(0, wp + n * F.cascade.z * 1.5);
         let s1 = shadow_sample(1, wp + n * F.cascade.w * 1.5);
-        return mix(s0, s1, smoothstep(F.cascade.x * 0.8, F.cascade.x, d));
+        return vec2f(mix(s0, s1, smoothstep(F.cascade.x * 0.8, F.cascade.x, d)), 1.0);
     }
     if (d < F.cascade.y) {
-        let s = shadow_sample(1, wp + n * F.cascade.w * 1.5);
-        return mix(s, 1.0, smoothstep(F.cascade.y * 0.75, F.cascade.y, d));
+        return vec2f(shadow_sample(1, wp + n * F.cascade.w * 1.5), 1.0 - smoothstep(F.cascade.y * 0.75, F.cascade.y, d));
     }
-    return 1.0;
+    return vec2f(1.0, 0.0);
+}
+
+// The terrain shadow map (sun_height.wgsl): how high the sun's rays over a point clear the
+// terrain, and the terrain with the forest canopy as a solid block.
+// The least penumbra (m), and the angle it widens by with the distance to the occluder: the
+// sun's radius, widened for the fuzzy edges of crowns and the map's 4-6 m texels.
+const SUN_H_PEN: f32 = 1.0;
+const SUN_H_SOFT: f32 = 0.012;
+// How much of the sun a closed canopy blocks, on average; the rest gets through in sunflecks.
+const CANOPY_SHADE: f32 = 0.65;
+
+// Sunlight at wp after the terrain (x), and after the terrain and the forest canopy (y). A point
+// below the heightmap (a coarse terrain patch between its vertices) counts as on it.
+fn sun_height_vis(wp: vec3f) -> vec2f {
+    let g = F.sun_grid;
+    let q = wp.xz;
+    if (any(q < vec2f(0.0)) || any(q > vec2f(F.world.x))) {
+        return vec2f(1.0);
+    }
+    let rel = q - F.world.x * 0.5;
+    let uv = vec2f(dot(rel, vec2f(-g.y, g.x)), -dot(rel, g.xy)) / g.w + 0.5;
+    let s = textureSampleLevel(t_sun_h, s_clamp, uv, 0.0);
+    let above = max(wp.y - height_at(q), 0.0);
+    // vertical spread of the penumbra at that distance from the occluder
+    let k = SUN_H_SOFT * (1.0 + g.z * g.z);
+    let pt = SUN_H_PEN + s.w * k;
+    let pc = SUN_H_PEN + s.y * k;
+    // biased by the least penumbra, so open ground (where the map is the ground itself) is lit
+    return vec2f(smoothstep(-pt, pt, above - s.z + SUN_H_PEN * 1.25), smoothstep(-pc, pc, above - s.x + SUN_H_PEN * 1.25));
+}
+
+// Sunlight on the open ground beyond the cascades: a closed canopy shades it, and the forest
+// masses cast their shadows onto the meadows next to them.
+fn far_ground_vis(v: vec2f) -> f32 {
+    return v.x * (1.0 - CANOPY_SHADE * (1.0 - v.y));
+}
+
+// Sun shadow for leaves, bark, grass and anything else above the ground: the cascades, and the
+// terrain's shadow, both beyond them and from mountains further towards the sun than the
+// cascades reach (1.5 km).
+fn shadow_at(wp: vec3f, n: vec3f) -> f32 {
+    let t = sun_height_vis(wp).x;
+    let c = cascade_shadow(wp, n);
+    return mix(t, min(c.x, t), c.y);
+}
+
+// The same for the ground, which beyond the cascades the forest canopy shades too.
+fn shadow_ground(wp: vec3f, n: vec3f) -> f32 {
+    let v = sun_height_vis(wp);
+    let c = cascade_shadow(wp, n);
+    return mix(far_ground_vis(v), min(c.x, v.x), c.y);
 }
 
 // A tree's scale, bits 10-17 of its record (scatter.wgsl); forest.rs decodes it the same way.

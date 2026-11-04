@@ -44,18 +44,24 @@ fn sun_disk(dir: vec3f) -> vec3f {
 }
 
 @fragment
-fn fs(in: VOut) -> @location(0) vec4f {
+fn fs(in: VOut) -> SceneOut {
     let pn = F.inv_view_proj_rot * vec4f(in.ndc, 1.0, 1.0);
     let dir = normalize(pn.xyz / pn.w);
     let sky = sky_radiance(dir);
     var col = sky + sun_disk(dir);
 
     // rgb = light the clouds scatter towards us, a = how much of the sky shows through
-    let cl = textureSampleLevel(t_clouds, s_clamp, in.clip.xy * F.screen.zw, 0.0);
+    let suv = in.clip.xy * F.screen.zw;
+    let cl = textureSampleLevel(t_clouds, s_clamp, suv, 0.0);
     col = col * cl.a + cl.rgb;
     if (dir.y > 0.0) {
         // the most distant clouds dissolve into the haze at the horizon
         col = mix(col, sky, (1.0 - smoothstep(0.0, 0.1, dir.y)) * 0.5);
     }
-    return vec4f(min(col, vec3f(60000.0)), 1.0);
+    // the haze near the camera that lies in shadow: the shafts of light under the trees, seen
+    // against the sky (whose table has the air and the ground haze, not the haze among the trees)
+    let shade = ap_shade_full(suv, NEAR_DIST);
+    col = max(col - shade.rgb * shade.a, vec3f(0.0));
+    // no surface here for the screen-space lighting to work on
+    return SceneOut(vec4f(min(col, vec3f(60000.0)), 1.0), vec4f(0.0));
 }

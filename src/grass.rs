@@ -50,7 +50,7 @@ impl Grass {
         let draw_bg = bind_group(device, "grass draw", &draw_bgl, &[blades.as_entire_binding()]);
         let module = shader(device, "grass", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/grass.wgsl")]);
         let layout = pipeline_layout(device, &[global_bgl, &draw_bgl, pass_bgl]);
-        let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::ALL })];
+        let targets = scene_targets(hdr, true);
         let draw_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("grass"),
             layout: Some(&layout),

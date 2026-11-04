@@ -386,9 +386,9 @@ impl Forest {
             Some(VertexBufferLayout { array_stride: std::mem::size_of::<TreeVertex>() as u64, step_mode: VertexStepMode::Vertex, attributes: &vattrs }),
             Some(VertexBufferLayout { array_stride: 4, step_mode: VertexStepMode::Instance, attributes: &iattrs }),
         ];
-        let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::ALL })];
+        let targets = scene_targets(hdr, true);
         // Without MSAA there is no coverage to cut leaves with, so the prepass discards instead.
-        let depth_targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::empty() })];
+        let depth_targets = scene_targets(hdr, false);
         let pipe = |label: &str, vs: &str, fs: &str, depth: DepthStencilState, cutout: bool, targets: &[Option<ColorTargetState>]| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
