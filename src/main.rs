@@ -12,6 +12,7 @@ mod gpu;
 mod grass;
 mod hiz;
 mod hud;
+mod impostor;
 mod leaftex;
 mod player;
 mod renderer;
@@ -67,6 +68,7 @@ struct Args {
     prepass: bool,
     occlusion: bool,
     leaf_png: Option<String>,
+    impostor_png: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -88,6 +90,7 @@ fn parse_args() -> Args {
         prepass: true,
         occlusion: true,
         leaf_png: None,
+        impostor_png: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -123,6 +126,7 @@ fn parse_args() -> Args {
             "--no-occlusion" => a.occlusion = false,
             "--scale" => { a.scale = next(i).parse().ok(); i += 1; }
             "--leaf-png" => { a.leaf_png = Some(next(i)); i += 1; }
+            "--impostor-png" => { a.impostor_png = Some(next(i)); i += 1; }
             other => eprintln!("unknown argument: {other}"),
         }
         i += 1;
@@ -165,6 +169,10 @@ fn capture(args: &Args) {
     r.settings.occlusion = args.occlusion;
     if let Some(s) = args.scale {
         r.set_scale(&gpu.device, s);
+    }
+    if let Some(p) = &args.impostor_png {
+        r.forest.debug_impostors(&gpu.device, &gpu.queue, p);
+        println!("wrote {p} and {p}.data.png");
     }
     let path = FlyPath::new(&r.terrain);
     let cam = match args.cam {
@@ -294,7 +302,7 @@ fn stats_line(r: &Renderer) -> String {
     let s = &r.stats;
     let mut lod = [0u64; 4];
     for (d, n) in s.visible.iter().enumerate() {
-        lod[d % 4] += *n as u64;
+        lod[r.forest.draws[d].lod] += *n as u64;
     }
     format!(
         "trees {} · drawn L0 {} L1 {} L2 {} L3 {} · grass {} · {} tris",

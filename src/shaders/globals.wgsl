@@ -229,6 +229,18 @@ fn shadow_at(wp: vec3f, n: vec3f) -> f32 {
     return 1.0;
 }
 
+// A tree's scale, bits 10-17 of its record (scatter.wgsl); forest.rs decodes it the same way.
+const TREE_SCALE_MIN: f32 = 0.45;
+const TREE_SCALE_RANGE: f32 = 1.3;
+
+fn tree_scale(packed: u32) -> f32 {
+    return TREE_SCALE_MIN + f32((packed >> 10u) & 255u) / 255.0 * TREE_SCALE_RANGE;
+}
+
+fn tree_scale_bits(scale: f32) -> u32 {
+    return u32(round(saturate((scale - TREE_SCALE_MIN) / TREE_SCALE_RANGE) * 255.0));
+}
+
 fn lod_tint(lod: u32) -> vec3f {
     switch lod {
         case 0u: { return vec3f(1.0, 0.25, 0.2); }

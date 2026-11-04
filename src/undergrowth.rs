@@ -3,6 +3,7 @@
 //! records have the same layout as the trees', so they are drawn with the tree pipeline: one
 //! indirect draw per kind.
 
+use crate::forest::Forest;
 use crate::treegen::{self, TreeVertex};
 use crate::util::*;
 use bytemuck::{cast_slice, Pod, Zeroable};
@@ -40,7 +41,7 @@ pub struct Undergrowth {
 }
 
 impl Undergrowth {
-    pub fn new(device: &Device, global_bgl: &BindGroupLayout, tree_bgl: &BindGroupLayout) -> Undergrowth {
+    pub fn new(device: &Device, global_bgl: &BindGroupLayout, forest: &Forest) -> Undergrowth {
         let plants = treegen::build_plants();
         let mut verts: Vec<TreeVertex> = Vec::new();
         let mut idx: Vec<u32> = Vec::new();
@@ -75,7 +76,7 @@ impl Undergrowth {
         let gen_bg = bind_group(device, "plant gen", &gen_bgl, &[params_buf.as_entire_binding(), records.as_entire_binding(), args_buf.as_entire_binding()]);
         let module = shader(device, "plant gen", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/undergrowth.wgsl")]);
         let gen_pipe = compute_pipeline(device, "plant gen", &pipeline_layout(device, &[global_bgl, &gen_bgl]), &module, "main");
-        let draw_bg = bind_group(device, "plants", tree_bgl, &[records.as_entire_binding()]);
+        let draw_bg = forest.records_bind_group(device, &records);
         let dim = (RADIUS * 2.0 / CELL).ceil() as u32 + 2;
         Undergrowth { params_buf, args_buf, reset_args, kinds, vbuf, ibuf, ids, gen_bg, draw_bg, gen_pipe, dim }
     }

@@ -1,6 +1,8 @@
 // Per-frame GPU culling + LOD selection. One thread per tree: frustum test, pick a
-// LOD from distance, then append the tree index into that (species, LOD) bucket and
-// bump the bucket's indirect instance count. The CPU never looks at individual trees.
+// LOD from distance, then append the tree index into its bucket and bump the bucket's
+// indirect instance count. The CPU never looks at individual trees. The mesh LODs have a
+// bucket per tree shape (forest.rs); the impostor LODs one each, shared by every shape.
+// forest.rs puts SLOTS and DRAWS in front.
 //
 // The camera culls in two passes. The first appends only the near LODs, which are drawn
 // first as occluders; the second, after a depth pyramid has been built from them and the
@@ -14,9 +16,9 @@ struct Cull {
     planes: array<vec4f, 8>,   // unused ones are (0, 0, 0, 1)
     cam: vec4f,                 // xyz LOD reference position, w = max draw distance
     lod: vec4f,                 // x,y,z LOD switch distances, w = LOD bias
-    counts: vec4u,              // x = tree count, y = mode, z = LODs drawn as occluders
-    regions: array<vec4u, 12>,  // x = first slot in visible[], y = capacity
-    bounds: array<vec4f, 4>,    // per species: x = sphere centre height, y = radius
+    counts: vec4u,              // x = tree count, y = mode, z = LODs drawn as occluders, w = LOD2's bucket
+    shapes: array<vec4f, SLOTS>, // per shape slot: x = sphere centre height, y = radius, z = its LOD0 bucket
+    regions: array<vec4u, DRAWS>, // per bucket: x = first slot in visible[], y = capacity
     view: mat4x4f,              // the camera, for the occlusion test
     proj: vec4f,                // x, y = the projection's x and y scale, z = near plane
     hiz: vec4f,                 // depth pyramid: screen width and height in pixels, levels
@@ -27,10 +29,6 @@ struct Cull {
 @group(1) @binding(2) var<storage, read_write> args: array<atomic<u32>>;
 @group(1) @binding(3) var<storage, read_write> visible: array<u32>;
 @group(1) @binding(4) var hiz: texture_2d<f32>;
-
-fn tree_scale(packed: u32) -> f32 {
-    return 0.75 + f32((packed >> 10u) & 255u) / 255.0 * 0.55;
-}
 
 // Whether a sphere is hidden behind everything the depth pyramid holds: its nearest point is
 // farther away than the farthest depth over the box it covers on screen (reversed Z: 1 near).
@@ -90,9 +88,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg:
     let t = trees[i];
     let pos = bitcast<vec3f>(t.xyz);
     let packed = t.w;
-    let species = packed & 3u;
+    // the shape's slot: species * 8 + the low 3 bits of the seed
+    let b = C.shapes[(packed & 3u) * 8u + ((packed >> 18u) & 7u)];
     let scale = tree_scale(packed);
-    let b = C.bounds[species];
     let center = pos + vec3f(0.0, b.x * scale, 0.0);
     let radius = b.y * scale;
     for (var k = 0; k < 8; k++) {
@@ -125,7 +123,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg:
     if (mode == MODE_OCCLUDED && (lod < C.counts.z || occluded(center, radius))) {
         return;
     }
-    let draw = species * 4u + lod;
+    var draw = C.counts.w + lod - 2u;
+    if (lod < 2u) {
+        draw = u32(b.z) + lod;
+    }
     let reg = C.regions[draw];
     let slot = atomicAdd(&args[draw * 5u + 1u], 1u);
     if (slot >= reg.y) {

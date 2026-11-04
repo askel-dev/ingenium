@@ -32,6 +32,9 @@ const SUN_ILLUM: Vec3 = Vec3::new(3.4, 3.4, 3.4);
 /// pass opens the exposure up partway as the light falls below it.
 const EXPOSURE_KEY: f32 = 2.6;
 const BLOOM: f32 = 0.05;
+/// The stats readback: timestamps at 0, the sky light at 64, the grass draw args at 128, the
+/// tree draw args from 256.
+const READBACK_SIZE: u64 = (256 + DRAWS as u64 * 20).next_multiple_of(256);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -180,7 +183,7 @@ pub struct Settings {
     pub occlusion: bool,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Stats {
     /// Whole-frame GPU time of the latest timed frame.
     pub gpu_ms: f32,
@@ -192,6 +195,12 @@ pub struct Stats {
     /// Terrain patches picked by the LOD selection, then drawn by the camera, the near and
     /// the far shadow cascade.
     pub patches: [u32; 4],
+}
+
+impl Default for Stats {
+    fn default() -> Stats {
+        Stats { gpu_ms: 0.0, ground_light: 0.0, visible: [0; DRAWS], grass: 0, tris: 0, patches: [0; 4] }
+    }
 }
 
 // GPU timestamps of a timed frame, in submission order: the start of the frame, then the
@@ -614,7 +623,7 @@ impl Renderer {
         let mut terrain = terrain;
         terrain.create_pipelines(device, &global_bgl, &pass_bgl, HDR, msaa);
         let mut forest = Forest::new(device, queue, &global_bgl, &global_bg, &pass_bgl, HDR, msaa, WORLD);
-        let undergrowth = Undergrowth::new(device, &global_bgl, &forest.tree_bgl);
+        let undergrowth = Undergrowth::new(device, &global_bgl, &forest);
         let grass = Grass::new(device, &global_bgl, &pass_bgl, HDR, msaa);
 
         // sky
@@ -676,7 +685,7 @@ impl Renderer {
 
         let readbacks = (0..3)
             .map(|_| Readback {
-                buf: buffer(device, "stats readback", 512, BufferUsages::COPY_DST | BufferUsages::MAP_READ),
+                buf: buffer(device, "stats readback", READBACK_SIZE, BufferUsages::COPY_DST | BufferUsages::MAP_READ),
                 queries: timestamps.then(|| device.create_query_set(&QuerySetDescriptor { label: Some("timestamps"), ty: QueryType::Timestamp, count: TIMESTAMPS })),
                 resolve: buffer(device, "query resolve", 256, BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC),
                 pending: false,
@@ -837,7 +846,7 @@ impl Renderer {
         let receivers = [(0.0, CASCADES[0].1), (0.8 * CASCADES[0].1, CASCADES[1].1)];
         for (i, planes) in shadow_planes.iter().enumerate() {
             let mut lod = LOD_DIST;
-            lod.w = [0.0f32, 3.0][i]; // far cascade casts from the cheap hull LOD only
+            lod.w = [0.0f32, 3.0][i]; // the far cascade casts impostors only
             // a metre for wind sway and the normal offset, plus the filter's reach
             let margin = 1.0 + 3.0 * [texel0, texel1][i];
             let planes = caster_planes(cam, aspect, receivers[i].0, receivers[i].1, sun, margin).unwrap_or(pad_planes(*planes));
@@ -962,21 +971,19 @@ impl Renderer {
             });
             rp.set_bind_group(0, &self.global_bg, &[]);
             rp.set_bind_group(2, &self.pass_bgs[0], &[]);
-            // Leaves are cut out by alpha-to-coverage, which turns off the GPU's hidden surface
-            // removal: every leaf fragment that passes the depth test so far is shaded, in
-            // whatever order the culling appended the trees. Laying down their depth first
-            // (cheap: one texture read) lets the colour pass shade only the nearest surface.
-            // LOD 3 is an opaque hull with no leaf cards: nothing to gain, so it is drawn once.
-            // (with occlusion culling the near LODs' depth is already there)
+            // Leaves and impostors are cut out by alpha-to-coverage, which turns off the GPU's
+            // hidden surface removal: every fragment that passes the depth test so far is
+            // shaded, in whatever order the culling appended the trees. Laying down their depth
+            // first (cheap: a texture read or four) lets the colour pass shade only the nearest
+            // surface. (with occlusion culling the near LODs' depth is already there)
             if self.settings.prepass {
-                self.forest.draw(&mut rp, 0, TreePass::Depth, if occlusion { OCCLUDER_LODS..3 } else { 0..3 });
+                self.forest.draw(&mut rp, 0, TreePass::Depth, if occlusion { OCCLUDER_LODS..LODS } else { 0..LODS });
             }
             rp.set_bind_group(1, &self.pass_bgs[0], &[]);
             self.terrain.draw(&mut rp, 0);
             self.terrain.draw_canopy(&mut rp);
             if self.settings.prepass {
-                self.forest.draw(&mut rp, 0, TreePass::ColorEqual, 0..3);
-                self.forest.draw(&mut rp, 0, TreePass::Color, 3..LODS);
+                self.forest.draw(&mut rp, 0, TreePass::ColorEqual, 0..LODS);
             } else {
                 self.forest.draw(&mut rp, 0, TreePass::Color, 0..LODS);
             }
@@ -1025,7 +1032,7 @@ impl Renderer {
         if staged {
             let rb = &self.readbacks[slot];
             enc.copy_buffer_to_buffer(&self.forest.views[0].args_buf, 0, &rb.buf, 256, (DRAWS * 20) as u64);
-            enc.copy_buffer_to_buffer(&self.grass.args_buf, 0, &rb.buf, 496, 16);
+            enc.copy_buffer_to_buffer(&self.grass.args_buf, 0, &rb.buf, 128, 16);
             enc.copy_buffer_to_buffer(&self.sky.light_buf, 0, &rb.buf, 64, 64);
         }
         let mut resolved = Vec::new();
@@ -1077,7 +1084,7 @@ impl Renderer {
                     self.stats.visible[d] = n;
                     tris += n as u64 * self.forest.draws[d].tris as u64;
                 }
-                self.stats.grass = if self.settings.grass { words[124 + 1] } else { 0 };
+                self.stats.grass = if self.settings.grass { words[32 + 1] } else { 0 };
                 tris += self.stats.grass as u64 * 5;
                 self.stats.tris = tris;
                 self.stats.patches = [self.terrain.selected, self.terrain.drawn(0), self.terrain.drawn(1), self.terrain.drawn(2)];

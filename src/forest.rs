@@ -1,21 +1,31 @@
-//! The forest: GPU scatter of ~a million trees, per-view GPU culling + LOD selection
-//! into indirect draw buckets, and instanced rendering of the culled lists.
+//! The forest: GPU scatter of ~a million trees, per-view GPU culling + LOD selection into
+//! indirect draw buckets, and instanced rendering of the culled lists. Near trees are meshes,
+//! with a bucket per tree shape and mesh LOD; from LOD2 on every tree is an impostor
+//! (impostor.rs), one bucket per LOD for all shapes.
 
-use crate::treegen::{self, TreeVertex};
+use crate::impostor::{self, Atlas, BakeItem};
+use crate::treegen::{self, Shape, TreeVertex, KIND_LEAF, NO_SLOT, SHAPES, SLOTS, VARIANTS};
 use crate::util::*;
 use bytemuck::{cast_slice, Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::*;
 
-pub const SPECIES: usize = 3;
 pub const LODS: usize = 4;
-pub const DRAWS: usize = 12; // 3 species * 4 LODs (fits the 12-entry uniform arrays)
+/// LODs below this are meshes, the rest impostors.
+pub const MESH_LODS: usize = 2;
+/// Draw buckets: one per shape and mesh LOD, then one per impostor LOD.
+pub const DRAWS: usize = SHAPES * MESH_LODS + (LODS - MESH_LODS);
 pub const SCATTER_CELL: f32 = 5.5;
 /// Planes a tree is culled against in each view (a frustum uses 6; the rest are padding).
 pub const CULL_PLANES: usize = 8;
 /// With occlusion culling, the camera's LODs below this are drawn first, as occluders; the
 /// rest are culled against the depth they leave (see cull.wgsl).
 pub const OCCLUDER_LODS: usize = 2;
+
+/// A tree's scale from its record (bits 10-17), as `tree_scale` in globals.wgsl decodes it.
+pub fn tree_scale(packed: u32) -> f32 {
+    0.45 + ((packed >> 10) & 255) as f32 / 255.0 * 1.3
+}
 
 // cull.wgsl's modes
 const MODE_ALL: u32 = 0;
@@ -29,11 +39,20 @@ struct CullParams {
     cam: Vec4,
     lod: Vec4,
     counts: [u32; 4],
-    regions: [[u32; 4]; 12],
-    bounds: [Vec4; 4],
+    shapes: [Vec4; SLOTS],
+    regions: [[u32; 4]; DRAWS],
     view: Mat4,
     proj: Vec4,
     hiz: Vec4,
+}
+
+/// One tree shape for the shaders (`Shape` in tree_common.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShapeGpu {
+    crown_c: Vec4,
+    crown_r: Vec4,
+    imp: Vec4,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -42,6 +61,13 @@ pub struct DrawRange {
     pub first_index: u32,
     pub base_vertex: i32,
     pub tris: u32,
+    pub lod: usize,
+}
+
+impl DrawRange {
+    fn impostor(&self) -> bool {
+        self.lod >= MESH_LODS
+    }
 }
 
 pub struct CullView {
@@ -49,7 +75,7 @@ pub struct CullView {
     pub args_buf: Buffer,
     visible_buf: Buffer,
     bind_group: BindGroup,
-    regions: [[u32; 4]; 12],
+    regions: [[u32; 4]; DRAWS],
     reset_args: Vec<u32>,
 }
 
@@ -64,6 +90,25 @@ pub enum TreePass {
     Depth,
     /// Shaded where the prepass left this surface's depth: no cut-out, no depth writes.
     ColorEqual,
+}
+
+/// The four pipelines of one kind of tree geometry (meshes or impostors), by `TreePass`.
+struct Pipes {
+    shadow: RenderPipeline,
+    color: RenderPipeline,
+    depth: RenderPipeline,
+    color_equal: RenderPipeline,
+}
+
+impl Pipes {
+    fn get(&self, kind: TreePass) -> &RenderPipeline {
+        match kind {
+            TreePass::Shadow => &self.shadow,
+            TreePass::Color => &self.color,
+            TreePass::Depth => &self.depth,
+            TreePass::ColorEqual => &self.color_equal,
+        }
+    }
 }
 
 pub struct Forest {
@@ -81,13 +126,14 @@ pub struct Forest {
     hiz_info: Vec4,
     _dummy_hiz: Texture,
     tree_bg: BindGroup,
-    /// group 1 of the tree pipelines: the instance records (`trees` in tree.wgsl)
-    pub tree_bgl: BindGroupLayout,
-    pipe_color: RenderPipeline,
-    pipe_depth: RenderPipeline,
-    pipe_color_equal: RenderPipeline,
-    pipe_shadow: RenderPipeline,
-    bounds: [Vec4; 4],
+    /// group 1 of the tree pipelines: the instance records (`trees` in tree.wgsl), the shape
+    /// table and the impostor atlas
+    tree_bgl: BindGroupLayout,
+    shapes_buf: Buffer,
+    atlas: Atlas,
+    mesh: Pipes,
+    impostor: Pipes,
+    cull_shapes: [Vec4; SLOTS],
     trees_buf: Buffer,
 }
 
@@ -99,6 +145,30 @@ pub struct ViewSetup {
     /// The camera's view matrix and projection scale (x, y), to cull its distant LODs in a
     /// second pass against the depth of the near ones (`cull_occluded`). Only for view 0.
     pub occlusion: Option<(Mat4, glam::Vec2)>,
+}
+
+/// Constants the tree and culling shaders are built with.
+fn shader_consts() -> String {
+    format!(
+        "const SLOTS: u32 = {SLOTS}u;\nconst DRAWS: u32 = {DRAWS}u;\nconst IMP_FRAMES: u32 = {}u;\nconst IMP_WARP: f32 = {:?};\n",
+        impostor::FRAMES,
+        impostor::WARP
+    )
+}
+
+/// For every slot, the shape that fills it: a slot without a shape of its own falls back to
+/// its species' first (the scatter never picks one).
+fn slot_shapes(shapes: &[Shape]) -> [usize; SLOTS] {
+    let mut out = [usize::MAX; SLOTS];
+    for (i, s) in shapes.iter().enumerate() {
+        out[s.slot()] = i;
+    }
+    for slot in 0..SLOTS {
+        if out[slot] == usize::MAX {
+            out[slot] = out[slot / VARIANTS * VARIANTS];
+        }
+    }
+    out
 }
 
 impl Forest {
@@ -113,27 +183,74 @@ impl Forest {
         msaa: u32,
         world: f32,
     ) -> Forest {
-        // ---- meshes
-        let species = treegen::build_all();
+        // ---- meshes: each shape's two mesh LODs, then the impostor quad
+        let shapes = treegen::build_shapes();
         let mut verts: Vec<TreeVertex> = Vec::new();
         let mut idx: Vec<u32> = Vec::new();
         let mut draws = [DrawRange::default(); DRAWS];
-        let mut bounds = [Vec4::ZERO; 4];
-        for (s, sp) in species.iter().enumerate() {
-            bounds[s] = Vec4::new(sp.center_y, sp.radius, 0.0, 0.0);
-            for (l, m) in sp.lods.iter().enumerate() {
-                draws[s * LODS + l] = DrawRange {
+        for (s, shape) in shapes.iter().enumerate() {
+            for (l, m) in shape.lods.iter().enumerate() {
+                draws[s * MESH_LODS + l] = DrawRange {
                     index_count: m.idx.len() as u32,
                     first_index: idx.len() as u32,
                     base_vertex: verts.len() as i32,
                     tris: m.tris(),
+                    lod: l,
                 };
                 verts.extend_from_slice(&m.verts);
                 idx.extend_from_slice(&m.idx);
             }
         }
+        let quad = DrawRange { index_count: 6, first_index: idx.len() as u32, base_vertex: verts.len() as i32, tris: 2, lod: 0 };
+        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            verts.push(TreeVertex { pos: [x, y, 0.0], nrm: [0.0, 0.0, 1.0], uv: [0.0; 2], attr: [KIND_LEAF, 0.0, 1.0, NO_SLOT] });
+        }
+        idx.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        for l in MESH_LODS..LODS {
+            draws[SHAPES * MESH_LODS + l - MESH_LODS] = DrawRange { lod: l, ..quad };
+        }
         let vbuf = buffer_init(device, "tree verts", cast_slice(&verts), BufferUsages::VERTEX);
         let ibuf = buffer_init(device, "tree idx", cast_slice(&idx), BufferUsages::INDEX);
+
+        // ---- the shape table, and what culling needs of it
+        let fits: Vec<impostor::Fit> = shapes.iter().map(|s| impostor::fit(&s.lods[0])).collect();
+        let by_slot = slot_shapes(&shapes);
+        let mut gpu_shapes = [ShapeGpu::zeroed(); SLOTS];
+        let mut cull_shapes = [Vec4::ZERO; SLOTS];
+        for slot in 0..SLOTS {
+            let i = by_slot[slot];
+            let (s, f) = (&shapes[i], &fits[i]);
+            gpu_shapes[slot] = ShapeGpu {
+                crown_c: s.crown_center.extend(s.density),
+                crown_r: s.crown_radii.extend(s.species as f32),
+                imp: Vec4::new(f.center_y, f.half, f.depth, i as f32),
+            };
+            cull_shapes[slot] = Vec4::new(s.center_y, s.radius, (i * MESH_LODS) as f32, 0.0);
+        }
+        let shapes_buf = buffer_init(device, "tree shapes", cast_slice(&gpu_shapes), BufferUsages::UNIFORM);
+
+        // ---- impostors
+        let consts = shader_consts();
+        let atlas = Atlas::new(device, SHAPES as u32);
+        let items: Vec<BakeItem> = (0..SHAPES)
+            .map(|i| {
+                let d = draws[i * MESH_LODS];
+                BakeItem { layer: i as u32, index_count: d.index_count, first_index: d.first_index, base_vertex: d.base_vertex }
+            })
+            .collect();
+        let tree_common = include_str!("shaders/tree_common.wgsl");
+        impostor::bake(
+            device,
+            queue,
+            global_bgl,
+            global_bg,
+            &[&consts, NOISE_WGSL, GLOBALS_WGSL, tree_common, include_str!("shaders/impostor_bake.wgsl")],
+            &shapes_buf,
+            &vbuf,
+            &ibuf,
+            &items,
+            &atlas,
+        );
 
         // ---- scatter
         let dim = (world / SCATTER_CELL) as u32;
@@ -170,7 +287,7 @@ impl Forest {
         queue.submit([enc.finish()]);
         let n: u32 = cast_slice::<u8, u32>(&read_buffer_blocking(device, &counter_rb, 4))[0];
         let tree_count = n.min(cap);
-        println!("forest: scattered {tree_count} trees from {cap} candidate cells");
+        println!("forest: scattered {tree_count} trees and shrubs from {cap} candidate cells");
 
         // ---- culling
         let cull_bgl = bgl(
@@ -196,21 +313,22 @@ impl Forest {
             view_formats: &[],
         });
         let dummy_hiz_view = dummy_hiz.create_view(&Default::default());
-        let module = shader(device, "cull", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/cull.wgsl")]);
+        let module = shader(device, "cull", &[&consts, NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/cull.wgsl")]);
         let pl = pipeline_layout(device, &[global_bgl, &cull_bgl]);
         let cull_pipe = compute_pipeline(device, "cull", &pl, &module, "main");
 
-        let main_caps = [8_000u32, 50_000, 220_000, 700_000];
-        let shadow_caps = [8_000u32, 50_000, 120_000, 120_000];
+        // Room in each bucket: a mesh bucket only ever holds the trees of one shape near the
+        // view; an impostor bucket may need every tree.
+        let main_caps = [3_000u32, 20_000];
+        let shadow_caps = [3_000u32, 12_000];
         let mut views = Vec::new();
         for caps in [main_caps, shadow_caps, shadow_caps] {
-            let mut regions = [[0u32; 4]; 12];
+            let mut regions = [[0u32; 4]; DRAWS];
             let mut cursor = 0;
-            for s in 0..SPECIES {
-                for l in 0..LODS {
-                    regions[s * LODS + l] = [cursor, caps[l], 0, 0];
-                    cursor += caps[l];
-                }
+            for (d, r) in regions.iter_mut().enumerate() {
+                let cap = if draws[d].impostor() { tree_count.max(1) } else { caps[draws[d].lod] };
+                *r = [cursor, cap, 0, 0];
+                cursor += cap;
             }
             let mut reset_args = vec![0u32; DRAWS * 5];
             for d in 0..DRAWS {
@@ -244,9 +362,18 @@ impl Forest {
         }
 
         // ---- rendering
-        let tree_bgl = bgl(device, "trees", &[storage_entry(0, ShaderStages::VERTEX, true)]);
-        let tree_bg = bind_group(device, "trees", &tree_bgl, &[trees_buf.as_entire_binding()]);
-        let module = shader(device, "tree", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/tree.wgsl")]);
+        let tree_bgl = bgl(
+            device,
+            "trees",
+            &[
+                storage_entry(0, ShaderStages::VERTEX, true),
+                uniform_entry(1, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
+                texture_entry(2, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
+                texture_entry(3, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
+            ],
+        );
+        let tree_bg = Self::records_bg(device, &tree_bgl, &trees_buf, &shapes_buf, &atlas);
+        let module = shader(device, "tree", &[&consts, NOISE_WGSL, GLOBALS_WGSL, tree_common, include_str!("shaders/tree.wgsl")]);
         let layout = pipeline_layout(device, &[global_bgl, &tree_bgl, pass_bgl]);
         let vattrs = [
             VertexAttribute { format: VertexFormat::Float32x3, offset: 0, shader_location: 0 },
@@ -260,38 +387,34 @@ impl Forest {
             Some(VertexBufferLayout { array_stride: 4, step_mode: VertexStepMode::Instance, attributes: &iattrs }),
         ];
         let targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::ALL })];
-        let main_pipe = |label: &str, fs: &str, depth: DepthStencilState, cutout: bool, targets: &[Option<ColorTargetState>]| {
+        // Without MSAA there is no coverage to cut leaves with, so the prepass discards instead.
+        let depth_targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::empty() })];
+        let pipe = |label: &str, vs: &str, fs: &str, depth: DepthStencilState, cutout: bool, targets: &[Option<ColorTargetState>]| {
             device.create_render_pipeline(&RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
-                vertex: VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &buffers },
+                vertex: VertexState { module: &module, entry_point: Some(vs), compilation_options: Default::default(), buffers: &buffers },
                 primitive: PrimitiveState::default(),
                 depth_stencil: Some(depth),
-                multisample: MultisampleState { count: msaa, mask: !0, alpha_to_coverage_enabled: cutout && msaa > 1 },
+                multisample: MultisampleState { count: if targets.is_empty() { 1 } else { msaa }, mask: !0, alpha_to_coverage_enabled: cutout && msaa > 1 },
                 fragment: Some(FragmentState { module: &module, entry_point: Some(fs), compilation_options: Default::default(), targets }),
                 multiview_mask: None,
                 cache: None,
             })
         };
         let write_depth = depth_state(TextureFormat::Depth32Float, true, CompareFunction::GreaterEqual);
-        let pipe_color = main_pipe("tree", "fs", write_depth.clone(), true, &targets);
-        // Without MSAA there is no coverage to cut leaves with, so the prepass discards instead.
-        let depth_targets = [Some(ColorTargetState { format: hdr, blend: None, write_mask: ColorWrites::empty() })];
-        let depth_fs = if msaa > 1 { "fs_depth" } else { "fs_depth_test" };
-        let pipe_depth = main_pipe("tree depth", depth_fs, write_depth, true, &depth_targets);
         let equal = depth_state(TextureFormat::Depth32Float, false, CompareFunction::Equal);
-        let pipe_color_equal = main_pipe("tree shade", "fs", equal, false, &targets);
-        let pipe_shadow = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("tree shadow"),
-            layout: Some(&layout),
-            vertex: VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &buffers },
-            primitive: PrimitiveState::default(),
-            depth_stencil: Some(shadow_depth_state()),
-            multisample: MultisampleState::default(),
-            fragment: Some(FragmentState { module: &module, entry_point: Some("fs_shadow"), compilation_options: Default::default(), targets: &[] }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipes = |name: &str, vs: &str, fs: &str| {
+            let depth_fs = if msaa > 1 { format!("{fs}_depth") } else { format!("{fs}_depth_test") };
+            Pipes {
+                shadow: pipe(&format!("{name} shadow"), vs, &format!("{fs}_shadow"), shadow_depth_state(), false, &[]),
+                color: pipe(name, vs, fs, write_depth.clone(), true, &targets),
+                depth: pipe(&format!("{name} depth"), vs, &depth_fs, write_depth.clone(), true, &depth_targets),
+                color_equal: pipe(&format!("{name} shade"), vs, fs, equal.clone(), false, &targets),
+            }
+        };
+        let mesh = pipes("tree", "vs", "fs");
+        let impostor = pipes("tree impostor", "vs_impostor", "fs_impostor");
 
         let late_params = buffer(device, "cull params late", std::mem::size_of::<CullParams>() as u64, BufferUsages::UNIFORM | BufferUsages::COPY_DST);
         Forest {
@@ -308,13 +431,37 @@ impl Forest {
             _dummy_hiz: dummy_hiz,
             tree_bg,
             tree_bgl,
-            pipe_color,
-            pipe_depth,
-            pipe_color_equal,
-            pipe_shadow,
-            bounds,
+            shapes_buf,
+            atlas,
+            mesh,
+            impostor,
+            cull_shapes,
             trees_buf,
         }
+    }
+
+    fn records_bg(device: &Device, layout: &BindGroupLayout, records: &Buffer, shapes: &Buffer, atlas: &Atlas) -> BindGroup {
+        bind_group(
+            device,
+            "trees",
+            layout,
+            &[
+                records.as_entire_binding(),
+                shapes.as_entire_binding(),
+                BindingResource::TextureView(&atlas.color_view),
+                BindingResource::TextureView(&atlas.data_view),
+            ],
+        )
+    }
+
+    /// Writes the impostor atlas as PNGs (`--impostor-png`).
+    pub fn debug_impostors(&self, device: &Device, queue: &Queue, path: &str) {
+        self.atlas.debug_png(device, queue, path);
+    }
+
+    /// Group 1 of the tree pipelines for other records in the trees' layout (undergrowth.rs).
+    pub fn records_bind_group(&self, device: &Device, records: &Buffer) -> BindGroup {
+        Self::records_bg(device, &self.tree_bgl, records, &self.shapes_buf, &self.atlas)
     }
 
     /// One-time copy of the tree records (see scatter.wgsl) to the CPU, for trunk collision.
@@ -351,13 +498,14 @@ impl Forest {
 
     pub fn update_view(&self, queue: &Queue, view: usize, setup: &ViewSetup) {
         let v = &self.views[view];
+        let first_impostor = (SHAPES * MESH_LODS) as u32;
         let mut params = CullParams {
             planes: setup.planes,
             cam: setup.ref_pos.extend(setup.max_dist),
             lod: setup.lod,
-            counts: [self.tree_count, MODE_ALL, OCCLUDER_LODS as u32, 0],
+            counts: [self.tree_count, MODE_ALL, OCCLUDER_LODS as u32, first_impostor],
+            shapes: self.cull_shapes,
             regions: v.regions,
-            bounds: self.bounds,
             view: Mat4::IDENTITY,
             proj: Vec4::ZERO,
             hiz: Vec4::ZERO,
@@ -366,7 +514,7 @@ impl Forest {
             assert_eq!(view, 0, "only the camera has a second culling pass");
             params.counts[1] = MODE_OCCLUDERS;
             let late = CullParams {
-                counts: [self.tree_count, MODE_OCCLUDED, OCCLUDER_LODS as u32, 0],
+                counts: [self.tree_count, MODE_OCCLUDED, OCCLUDER_LODS as u32, first_impostor],
                 view: cam_view,
                 proj: Vec4::new(scale.x, scale.y, crate::camera::NEAR, 0.0),
                 hiz: self.hiz_info,
@@ -396,26 +544,25 @@ impl Forest {
         cp.dispatch_workgroups(x, y, 1);
     }
 
-    /// The shaded, alpha-to-coverage tree pipeline, for other instanced foliage (undergrowth.rs).
+    /// The shaded, alpha-to-coverage mesh pipeline, for other instanced foliage (undergrowth.rs).
     pub fn color_pipeline(&self) -> &RenderPipeline {
-        &self.pipe_color
+        &self.mesh.color
     }
 
-    /// Draws the LODs in `lods` (0 = full detail, 3 = the canopy hull).
+    /// Draws the LODs in `lods` (0 = full detail, 2 and 3 = impostors).
     pub fn draw(&self, pass: &mut RenderPass<'_>, view: usize, kind: TreePass, lods: std::ops::Range<usize>) {
         let v = &self.views[view];
-        pass.set_pipeline(match kind {
-            TreePass::Shadow => &self.pipe_shadow,
-            TreePass::Color => &self.pipe_color,
-            TreePass::Depth => &self.pipe_depth,
-            TreePass::ColorEqual => &self.pipe_color_equal,
-        });
         pass.set_bind_group(1, &self.tree_bg, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.set_index_buffer(self.ibuf.slice(..), IndexFormat::Uint32);
-        for d in 0..DRAWS {
-            if !lods.contains(&(d % LODS)) {
+        let mut bound = None;
+        for (d, draw) in self.draws.iter().enumerate() {
+            if !lods.contains(&draw.lod) {
                 continue;
+            }
+            if bound != Some(draw.impostor()) {
+                pass.set_pipeline(if draw.impostor() { self.impostor.get(kind) } else { self.mesh.get(kind) });
+                bound = Some(draw.impostor());
             }
             let start = v.regions[d][0] as u64 * 4;
             pass.set_vertex_buffer(1, v.visible_buf.slice(start..));

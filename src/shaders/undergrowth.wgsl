@@ -3,6 +3,7 @@
 // patches of noise (ferns in drifts, ground cover in mats, the odd shrub), more of all of
 // it where the canopy opens up. Records have the tree layout (scatter.wgsl), so the tree
 // shader draws them: bits 0-1 the leaf texture layer, 2-9 rotation, 10-17 scale, 18-31 seed.
+// (Their meshes carry no tree shape, so only the record's layout matters.)
 
 struct Params {
     planes: array<vec4f, 6>,
@@ -77,7 +78,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
     }
     let rot = h4 & 255u;
-    let scale_q = (h4 >> 8u) & 255u;
+    let scale_q = tree_scale_bits(mix(0.75, 1.3, u01(pcg(h4))));
     let seed = (h5 >> 8u) & 0x3FFFu;
     let packed = u32(info.x) | (rot << 2u) | (scale_q << 10u) | (seed << 18u);
     let slot = atomicAdd(&args[kind * 5u + 1u], 1u);

@@ -3,9 +3,9 @@
 //! the free-fly (noclip) camera instead.
 
 use crate::camera::Camera;
-use crate::forest::SCATTER_CELL;
+use crate::forest::{tree_scale, SCATTER_CELL};
 use crate::terrain::Terrain;
-use crate::treegen::TRUNK_R;
+use crate::treegen::trunk_radius;
 use glam::{IVec2, Vec2, Vec3, Vec3Swizzles};
 
 const RADIUS: f32 = 0.35;
@@ -315,10 +315,12 @@ impl Trunks {
             if c.x < 0 || c.y < 0 || c.x >= dim || c.y >= dim {
                 continue;
             }
-            // bits 0-1 species, 10-17 scale (decoded as in tree.wgsl)
-            let species = (t[3] & 3).min(2) as usize;
-            let scale = 0.75 + ((t[3] >> 10) & 255) as f32 / 255.0 * 0.55;
-            let r = ((TRUNK_R[species] * scale / RADIUS_UNIT).round() as u32).clamp(1, 255);
+            // bits 0-1 species, 10-17 scale, the low 3 bits of the seed (from bit 18) the shape
+            let trunk = trunk_radius((t[3] & 3) as usize, ((t[3] >> 18) & 7) as usize);
+            if trunk <= 0.0 {
+                continue; // a shrub: walked through
+            }
+            let r = ((trunk * tree_scale(t[3]) / RADIUS_UNIT).round() as u32).clamp(1, 255);
             let f = p - c.as_vec2();
             cells[(c.y * dim + c.x) as usize] = quant(f.x) | quant(f.y) << 12 | r << 24;
         }
