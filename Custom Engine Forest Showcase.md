@@ -20,3 +20,25 @@ I have been working on a lot of stuff in Godot since the last video (GI, virtual
 Additionally I wanted to support expressive weather systems from the ground up (since it's going to be a big part of my game). I'm not 100% there yet but I will keep improving the realism.
 
 If you have questions feel free to ask.
+
+## Screenshots
+
+One frame every 10 seconds of the video, in `docs/showcase/`.
+
+![frame_01](<docs/showcase/frame_01.jpg>)
+![frame_02](<docs/showcase/frame_02.jpg>)
+![frame_03](<docs/showcase/frame_03.jpg>)
+![frame_04](<docs/showcase/frame_04.jpg>)
+![frame_05](<docs/showcase/frame_05.jpg>)
+![frame_06](<docs/showcase/frame_06.jpg>)
+![frame_07](<docs/showcase/frame_07.jpg>)
+![frame_08](<docs/showcase/frame_08.jpg>)
+![frame_09](<docs/showcase/frame_09.jpg>)
+![frame_10](<docs/showcase/frame_10.jpg>)
+![frame_11](<docs/showcase/frame_11.jpg>)
+![frame_12](<docs/showcase/frame_12.jpg>)
+![frame_13](<docs/showcase/frame_13.jpg>)
+![frame_14](<docs/showcase/frame_14.jpg>)
+![frame_15](<docs/showcase/frame_15.jpg>)
+![frame_16](<docs/showcase/frame_16.jpg>)
+![frame_17](<docs/showcase/frame_17.jpg>)
