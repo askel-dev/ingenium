@@ -21,7 +21,7 @@ mod util;
 use camera::{Camera, FlyPath};
 use glam::Vec3;
 use player::{Input, Player, Trunks};
-use renderer::Renderer;
+use renderer::{GpuTiming, Renderer};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -166,15 +166,11 @@ fn capture(args: &Args) {
         view_formats: &[],
     });
     let view = tex.create_view(&Default::default());
-    let mut gpu_ms = Vec::new();
     for f in 0..args.frames {
         r.render(&gpu.device, &gpu.queue, &view, &cam, args.time + f as f32 / 60.0);
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        if f > args.frames / 2 && r.stats.gpu_ms > 0.0 {
-            gpu_ms.push(r.stats.gpu_ms);
-        }
     }
-    // one more frame so the stats readback for the final image lands
+    // two more frames so the stats and timestamps of the last frames land
     r.render(&gpu.device, &gpu.queue, &view, &cam, args.time + args.frames as f32 / 60.0);
     gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
     r.render(&gpu.device, &gpu.queue, &view, &cam, args.time + args.frames as f32 / 60.0);
@@ -200,17 +196,46 @@ fn capture(args: &Args) {
     }
     let out = args.capture.as_ref().unwrap();
     write_png(out, args.width, args.height, &rgba);
-    gpu_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = gpu_ms.get(gpu_ms.len() / 2).copied().unwrap_or(0.0);
-    let s = &r.stats;
+
+    // the first half of the frames warms up (cloud reprojection, caches); the rest are timed
+    let warmup = (args.frames / 2) as u64;
+    let timings: Vec<GpuTiming> = r.take_timings().into_iter().filter(|t| t.frame > warmup).collect();
+    let ms = |v: Option<f32>| v.map_or("n/a".to_string(), |x| format!("{x:.2}"));
     println!(
-        "captured {out} ({}x{}) cam=({:.1},{:.1},{:.1}) yaw={:.3} pitch={:.3}\n  gpu {:.2} ms (median) · {}",
-        args.width, args.height, cam.pos.x, cam.pos.y, cam.pos.z, cam.yaw, cam.pitch, med, stats_line(&r)
+        "captured {out} ({}x{}) cam=({:.1},{:.1},{:.1}) yaw={:.3} pitch={:.3}\n  gpu {} ms (median of {} frames, whole frame) · {} ms through the main pass · {}",
+        args.width,
+        args.height,
+        cam.pos.x,
+        cam.pos.y,
+        cam.pos.z,
+        cam.yaw,
+        cam.pitch,
+        ms(median(timings.iter().map(|t| t.total_ms))),
+        timings.len(),
+        ms(median(timings.iter().filter_map(|t| t.through_main_ms))),
+        stats_line(&r)
     );
-    println!(
-        "  passes: cull+grass {:.2} · sky+clouds {:.2} · shadows {:.2} · main {:.2} ms · ground light {:.2}",
-        s.pass_ms[0], s.pass_ms[1], s.pass_ms[2], s.pass_ms[3], s.ground_light
-    );
+    // Per pass: the median over the frames whose timestamps all came back in order (their
+    // passes add up to the frame). Medians of the passes need not add up to the median frame.
+    let ordered: Vec<&GpuTiming> = timings.iter().filter(|t| t.ordered).collect();
+    let (split, note) = match ordered.len() {
+        0 if !timings.is_empty() => (timings.iter().collect(), " (approximate: no frame had its timestamps in order)".to_string()),
+        n if n < timings.len() => (ordered, format!(" ({} of {} frames left out: timestamps out of order)", timings.len() - n, timings.len())),
+        _ => (ordered, String::new()),
+    };
+    let passes: Vec<String> = renderer::GPU_SECTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| format!("{name} {}", ms(median(split.iter().filter_map(|t| t.sections[i])))))
+        .collect();
+    println!("  passes (median ms): {}{note} · ground light {:.2}", passes.join(" · "), r.stats.ground_light);
+}
+
+/// The median (upper, for an even count), or None if there are no values.
+fn median(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut v: Vec<f32> = values.collect();
+    v.sort_by(f32::total_cmp);
+    v.get(v.len() / 2).copied()
 }
 
 fn fmt_count(n: u64) -> String {
@@ -262,6 +287,7 @@ struct State {
     title_timer: f32,
     frame_times: Vec<f32>,
     cpu_times: Vec<f32>,
+    gpu_times: Vec<f32>,
 }
 
 struct App {
@@ -314,6 +340,7 @@ impl App {
             title_timer: 0.0,
             frame_times: Vec::new(),
             cpu_times: Vec::new(),
+            gpu_times: Vec::new(),
         });
     }
 }
@@ -447,17 +474,19 @@ impl State {
 
         self.frame_times.push(dt);
         self.cpu_times.push(cpu_ms);
+        self.gpu_times.extend(self.renderer.take_timings().iter().map(|t| t.total_ms));
         self.title_timer += dt;
         if self.title_timer > 0.5 {
             let n = self.frame_times.len() as f32;
             let fps = n / self.frame_times.iter().sum::<f32>();
             let cpu = self.cpu_times.iter().sum::<f32>() / n;
+            let gpu = median(self.gpu_times.drain(..)).unwrap_or(self.renderer.stats.gpu_ms);
             let title = format!(
                 "ingenium · {} · {:.1} fps · cpu {:.2} ms · gpu {:.2} ms · {} · {}",
                 self.mode_name(),
                 fps,
                 cpu,
-                self.renderer.stats.gpu_ms,
+                gpu,
                 stats_line(&self.renderer),
                 renderer::atmosphere(self.renderer.settings.atmos).name
             );

@@ -102,26 +102,25 @@ impl Bloom {
         self.mips.len() as u32
     }
 
-    pub fn record(&self, enc: &mut CommandEncoder) {
-        let mut pass = |target: &TextureView, load: LoadOp<Color>, pipe: &RenderPipeline, bg: &BindGroup| {
+    /// `timestamp` is written by the last pass.
+    pub fn record(&self, enc: &mut CommandEncoder, mut timestamp: Option<RenderPassTimestampWrites>) {
+        let n = self.mips.len();
+        let down = (0..n).map(|i| (i, LoadOp::Clear(Color::BLACK), if i == 0 { &self.down_first } else { &self.down }, &self.down_bgs[i]));
+        let up = (0..n - 1).rev().map(|i| (i, LoadOp::Load, &self.up, &self.up_bgs[i]));
+        let passes: Vec<_> = down.chain(up).collect();
+        let count = passes.len();
+        for (k, (i, load, pipe, bg)) in passes.into_iter().enumerate() {
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("bloom"),
-                color_attachments: &[Some(RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: Operations { load, store: StoreOp::Store } })],
+                color_attachments: &[Some(RenderPassColorAttachment { view: &self.mips[i], depth_slice: None, resolve_target: None, ops: Operations { load, store: StoreOp::Store } })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: if k + 1 == count { timestamp.take() } else { None },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             rp.set_pipeline(pipe);
             rp.set_bind_group(0, bg, &[]);
             rp.draw(0..3, 0..1);
-        };
-        for i in 0..self.mips.len() {
-            let pipe = if i == 0 { &self.down_first } else { &self.down };
-            pass(&self.mips[i], LoadOp::Clear(Color::BLACK), pipe, &self.down_bgs[i]);
-        }
-        for i in (0..self.mips.len() - 1).rev() {
-            pass(&self.mips[i], LoadOp::Load, &self.up, &self.up_bgs[i]);
         }
     }
 }

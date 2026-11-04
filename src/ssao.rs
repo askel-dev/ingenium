@@ -132,14 +132,17 @@ impl Ssao {
         });
     }
 
-    pub fn record(&self, enc: &mut CommandEncoder, global: &BindGroup) {
+    /// `timestamp` is written by the last of the three passes.
+    pub fn record(&self, enc: &mut CommandEncoder, global: &BindGroup, mut timestamp: Option<RenderPassTimestampWrites>) {
         let t = &self.t;
-        for (view, pipe, bg) in [(&t.hd, &self.prep_pipe, &t.depth_bg), (&t.raw, &self.ao_pipe, &t.hd_bg), (&t.out, &self.blur_pipe, &t.blur_bg)] {
+        let passes = [(&t.hd, &self.prep_pipe, &t.depth_bg), (&t.raw, &self.ao_pipe, &t.hd_bg), (&t.out, &self.blur_pipe, &t.blur_bg)];
+        for (k, (view, pipe, bg)) in passes.into_iter().enumerate() {
+            let last = k + 1 == passes.len();
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("ssao"),
                 color_attachments: &[Some(RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: Operations { load: LoadOp::Clear(Color::WHITE), store: StoreOp::Store } })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: if last { timestamp.take() } else { None },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });

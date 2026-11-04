@@ -40,11 +40,15 @@ takes a minute or two.
 | `F11` | borderless fullscreen |
 | `P` | print the camera as a `--cam` argument |
 
-The window title shows fps, CPU and GPU time, trees drawn per LOD and triangles per frame.
+The window title shows fps, CPU time, the median GPU time of the whole frame, trees drawn per LOD
+and triangles per frame.
 
 Command-line options: `--novsync` (benchmark), `--msaa 1|4`, `--atmos 0-3`, `--sun-shift <degrees>`, `--size 1920x1080`,
-and headless screenshots with `--capture out.png [--time 60] [--cam x,y,z,yaw,pitch] [--lod-tint] [--no-ao]`
-(a negative camera height in `--cam` means that many metres above the ground).
+and headless screenshots with `--capture out.png [--time 60] [--cam x,y,z,yaw,pitch] [--lod-tint] [--no-ao] [--frames 30]`
+(a negative camera height in `--cam` means that many metres above the ground). A capture renders
+`--frames` frames of the same view and prints the median GPU time over the second half of them:
+the whole frame, the span through the main pass and each pass (cull + grass, sky + clouds,
+shadows, main, SSAO, bloom, post).
 
 ## How it works
 

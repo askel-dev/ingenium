@@ -173,8 +173,8 @@ pub struct Settings {
 
 #[derive(Default, Clone)]
 pub struct Stats {
+    /// Whole-frame GPU time of the latest timed frame.
     pub gpu_ms: f32,
-    pub pass_ms: [f32; 5], // cull+grass compute, sky+clouds, shadows, main, (untimed)
     /// Light on flat ground from the sun and sky (what the exposure adapts to).
     pub ground_light: f32,
     pub visible: [u32; DRAWS],
@@ -183,8 +183,86 @@ pub struct Stats {
     pub patches: u32,
 }
 
+// GPU timestamps of a timed frame, in submission order: the start of the frame, then the
+// end of each section in GPU_SECTIONS.
+const TS_START: u32 = 0;
+const TS_CULL: u32 = 1;
+const TS_CLOUDS: u32 = 2;
+const TS_SHADOWS: u32 = 3;
+const TS_MAIN: u32 = 4;
+const TS_SSAO: u32 = 5;
+const TS_BLOOM: u32 = 6;
+const TS_POST: u32 = 7;
+const TIMESTAMPS: u32 = 8;
+/// What each timed section covers. A section runs from the end of the one before it, so
+/// the atmosphere tables count with the clouds and the near cascade with the shadows.
+pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+grass", "sky+clouds", "shadows", "main", "ssao", "bloom", "post"];
+
+/// GPU time of one frame, from its timestamps.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuTiming {
+    /// The frame the timestamps were taken in.
+    pub frame: u64,
+    /// Start of the culling pass to the end of the tonemap pass: the whole frame.
+    pub total_ms: f32,
+    /// Start of the culling pass to the end of the main pass, the span the timer covered
+    /// before SSAO, bloom and post were timed (to compare with older measurements).
+    pub through_main_ms: Option<f32>,
+    /// Time each section of GPU_SECTIONS adds after the ones before it finished. None if
+    /// its timestamp was not taken (SSAO off) or came back invalid; its time then counts
+    /// with the next section.
+    pub sections: [Option<f32>; TIMESTAMPS as usize - 1],
+    /// Every timestamp taken came back valid and in submission order, so the sections add
+    /// up to the total.
+    pub ordered: bool,
+}
+
+impl GpuTiming {
+    /// `ts`: the raw timestamps, `written`: a bit per timestamp the frame took,
+    /// `period`: nanoseconds per tick. None if the frame start or end is unusable.
+    fn parse(frame: u64, ts: &[u64], written: u32, period: f32) -> Option<GpuTiming> {
+        let ms = |a: u64, b: u64| ((b - a) as f64 * period as f64 / 1.0e6) as f32;
+        let start = ts[TS_START as usize];
+        if written & (1 << TS_START) == 0 || start == 0 || start == u64::MAX {
+            return None;
+        }
+        // A timestamp from this frame lies after its start and within a minute of it (slow
+        // enough for a software rasterizer). One that was not written (stale, from an earlier
+        // frame, or zero) or an error value does not.
+        let taken = |i: usize| written & (1 << i) != 0;
+        let valid = |i: usize| taken(i) && ts[i] != u64::MAX && ts[i] >= start && ms(start, ts[i]) < 60_000.0;
+        let end = TS_POST as usize;
+        if !valid(end) {
+            return None;
+        }
+        let mut sections = [None; TIMESTAMPS as usize - 1];
+        let mut ordered = true;
+        let mut done = start;
+        for i in 1..=end {
+            if !valid(i) {
+                ordered &= !taken(i);
+                continue;
+            }
+            ordered &= ts[i] >= done;
+            sections[i - 1] = Some(ms(done, ts[i].max(done)));
+            done = done.max(ts[i]);
+        }
+        let main = TS_MAIN as usize;
+        Some(GpuTiming { frame, total_ms: ms(start, ts[end]), through_main_ms: valid(main).then(|| ms(start, ts[main])), sections, ordered })
+    }
+}
+
 struct Readback {
     buf: Buffer,
+    /// The timestamps of the frame that fills this slot (None without timestamp support),
+    /// resolved into `resolve` and copied into `buf` one frame later.
+    queries: Option<QuerySet>,
+    resolve: Buffer,
+    /// Filled by frame `frame`, waiting for the next frame to resolve its timestamps.
+    pending: bool,
+    frame: u64,
+    /// A bit per timestamp that frame took.
+    written: u32,
     state: Arc<AtomicU32>, // 0 idle, 1 in flight, 2 ready
 }
 
@@ -224,10 +302,10 @@ pub struct Renderer {
     pub forest: Forest,
     grass: Grass,
     clouds: Clouds,
-    queries: Option<QuerySet>,
-    query_resolve: Buffer,
     timestamp_period: f32,
     readbacks: Vec<Readback>,
+    /// Timed frames read back since the last `take_timings`.
+    timings: Vec<GpuTiming>,
     frame_index: u64,
     pub stats: Stats,
     frozen: Option<Frozen>,
@@ -497,10 +575,16 @@ impl Renderer {
         });
         let post_bg = post_bind_group(device, &post_bgl, &targets.hdr, &post_buf, &bloom, &post_sampler, &sky, &ssao);
 
-        let queries = timestamps.then(|| device.create_query_set(&QuerySetDescriptor { label: Some("timestamps"), ty: QueryType::Timestamp, count: 5 }));
-        let query_resolve = buffer(device, "query resolve", 256, BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC);
         let readbacks = (0..3)
-            .map(|_| Readback { buf: buffer(device, "stats readback", 512, BufferUsages::COPY_DST | BufferUsages::MAP_READ), state: Arc::new(AtomicU32::new(0)) })
+            .map(|_| Readback {
+                buf: buffer(device, "stats readback", 512, BufferUsages::COPY_DST | BufferUsages::MAP_READ),
+                queries: timestamps.then(|| device.create_query_set(&QuerySetDescriptor { label: Some("timestamps"), ty: QueryType::Timestamp, count: TIMESTAMPS })),
+                resolve: buffer(device, "query resolve", 256, BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC),
+                pending: false,
+                frame: 0,
+                written: 0,
+                state: Arc::new(AtomicU32::new(0)),
+            })
             .collect();
 
         println!("renderer ready in {:.2}s", t0.elapsed().as_secs_f32());
@@ -529,10 +613,9 @@ impl Renderer {
             forest,
             grass,
             clouds,
-            queries,
-            query_resolve,
             timestamp_period: queue.get_timestamp_period(),
             readbacks,
+            timings: Vec::new(),
             frame_index: 0,
             stats: Stats::default(),
             frozen: None,
@@ -625,9 +708,20 @@ impl Renderer {
         self.grass.update(queue, cull_planes, ref_pos);
         self.clouds.update(queue, vp_rot, cam, sun, fu.cloud_shadow, fu.clouds);
 
+        // Stats readback (non-blocking ring): a frame whose slot is free is timed and read back.
+        let slot = (self.frame_index % self.readbacks.len() as u64) as usize;
+        let staged = !self.readbacks[slot].pending && self.readbacks[slot].state.load(Ordering::Acquire) == 0;
+        let qs = if staged { self.readbacks[slot].queries.clone() } else { None };
+        let written = match (&qs, self.settings.ssao) {
+            (None, _) => 0,
+            (Some(_), true) => (1 << TIMESTAMPS) - 1,
+            (Some(_), false) => ((1 << TIMESTAMPS) - 1) & !(1 << TS_SSAO),
+        };
+        let pass_end = |i: u32| qs.as_ref().map(|q| RenderPassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(i) });
+
         let mut enc = device.create_command_encoder(&Default::default());
         {
-            let tw = self.queries.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) });
+            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: Some(TS_START), end_of_pass_write_index: Some(TS_CULL) });
             let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("cull"), timestamp_writes: tw });
             for v in 0..3 {
                 self.forest.cull(&mut cp, &self.global_bg, v);
@@ -640,14 +734,13 @@ impl Renderer {
         let sky_params = SkyParams { sun_dir: sun, sun_illum: SUN_ILLUM, haze: atm.haze, cam_alt_m: cam.pos.y, overcast: atm.overcast, ground_albedo: 0.12, fog: fu.fog };
         self.sky.update(queue, &mut enc, &sky_params);
         {
-            let tw = self.queries.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(2) });
+            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(TS_CLOUDS) });
             let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("clouds"), timestamp_writes: tw });
             self.clouds.render_shadow(&mut cp, &self.global_bg_shadow);
             self.sky.aerial(&mut cp, &self.global_bg_shadow);
             self.clouds.march(&mut cp, &self.global_bg);
         }
         for c in 0..2 {
-            let tw = self.queries.as_ref().filter(|_| c == 1).map(|q| RenderPassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(3) });
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("shadow"),
                 color_attachments: &[],
@@ -656,7 +749,7 @@ impl Renderer {
                     depth_ops: Some(Operations { load: LoadOp::Clear(1.0), store: StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: tw,
+                timestamp_writes: if c == 1 { pass_end(TS_SHADOWS) } else { None },
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -684,7 +777,7 @@ impl Renderer {
                     depth_ops: Some(Operations { load: LoadOp::Clear(0.0), store: StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.queries.as_ref().map(|q| RenderPassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(4) }),
+                timestamp_writes: pass_end(TS_MAIN),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -702,14 +795,13 @@ impl Renderer {
             rp.set_bind_group(1, self.clouds.output(), &[]);
             rp.draw(0..3, 0..1);
         }
-        // SSAO, bloom and post are not timed: on Metal their pass timestamps came back stale
-        // or out of order
         if self.settings.ssao {
-            self.ssao.record(&mut enc, &self.global_bg);
+            self.ssao.record(&mut enc, &self.global_bg, pass_end(TS_SSAO));
         } else {
+            // not timed: it draws nothing, and an empty pass may not take a timestamp on Metal
             self.ssao.clear(&mut enc);
         }
-        self.bloom.record(&mut enc);
+        self.bloom.record(&mut enc, pass_end(TS_BLOOM));
         {
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
                 label: Some("post"),
@@ -720,7 +812,7 @@ impl Renderer {
                     ops: Operations { load: LoadOp::Clear(Color::BLACK), store: StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: pass_end(TS_POST),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -729,56 +821,152 @@ impl Renderer {
             rp.draw(0..3, 0..1);
         }
 
-        // stats readback (non-blocking ring)
-        let slot = (self.frame_index % self.readbacks.len() as u64) as usize;
-        let staged = self.readbacks[slot].state.load(Ordering::Acquire) == 0;
+        // This frame's counts are copied now, but its timestamps are resolved by the next
+        // frame. Resolved in the frame's own command buffer, the timestamps of the last
+        // passes (SSAO, bloom, post) came back stale on Metal, probably because the resolve
+        // does not wait for those passes to write them. A frame later they are final: that
+        // frame's main pass overwrites the image those passes read, so it runs after them,
+        // and in capture mode the GPU is idle between frames anyway.
         if staged {
             let rb = &self.readbacks[slot];
-            if let Some(q) = &self.queries {
-                enc.resolve_query_set(q, 0..5, &self.query_resolve, 0);
-                enc.copy_buffer_to_buffer(&self.query_resolve, 0, &rb.buf, 0, 40);
-            }
             enc.copy_buffer_to_buffer(&self.forest.views[0].args_buf, 0, &rb.buf, 256, (DRAWS * 20) as u64);
             enc.copy_buffer_to_buffer(&self.grass.args_buf, 0, &rb.buf, 496, 16);
             enc.copy_buffer_to_buffer(&self.sky.light_buf, 0, &rb.buf, 64, 64);
         }
-        queue.submit([enc.finish()]);
+        let mut resolved = Vec::new();
+        for (k, rb) in self.readbacks.iter_mut().enumerate() {
+            if rb.pending {
+                if let Some(q) = &rb.queries {
+                    enc.resolve_query_set(q, 0..TIMESTAMPS, &rb.resolve, 0);
+                    enc.copy_buffer_to_buffer(&rb.resolve, 0, &rb.buf, 0, TIMESTAMPS as u64 * 8);
+                }
+                rb.pending = false;
+                resolved.push(k);
+            }
+        }
         if staged {
-            let rb = &self.readbacks[slot];
+            let rb = &mut self.readbacks[slot];
+            rb.pending = true;
+            rb.frame = self.frame_index;
+            rb.written = written;
+        }
+        queue.submit([enc.finish()]);
+        for k in resolved {
+            let rb = &self.readbacks[k];
             rb.state.store(1, Ordering::Release);
             let st = rb.state.clone();
             rb.buf.map_async(MapMode::Read, .., move |r| st.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release));
         }
         let _ = device.poll(PollType::Poll);
-        for rb in &self.readbacks {
-            if rb.state.load(Ordering::Acquire) == 2 {
-                {
-                    let view = rb.buf.get_mapped_range(..).expect("mapped range");
-                    let words: &[u32] = cast_slice(&view);
-                    if self.queries.is_some() {
-                        let ts: Vec<u64> = (0..5).map(|i| words[i * 2] as u64 | ((words[i * 2 + 1] as u64) << 32)).collect();
-                        if ts[..5].windows(2).all(|w| w[1] >= w[0]) && ts[4] > ts[0] {
-                            let ms = |a: u64, b: u64| (b - a) as f32 * self.timestamp_period / 1.0e6;
-                            self.stats.gpu_ms = ms(ts[0], ts[4]);
-                            self.stats.pass_ms = [ms(ts[0], ts[1]), ms(ts[1], ts[2]), ms(ts[2], ts[3]), ms(ts[3], ts[4]), 0.0];
+        let mut ready: Vec<usize> = (0..self.readbacks.len()).filter(|&k| self.readbacks[k].state.load(Ordering::Acquire) == 2).collect();
+        ready.sort_by_key(|&k| self.readbacks[k].frame);
+        for k in ready {
+            let rb = &self.readbacks[k];
+            {
+                let view = rb.buf.get_mapped_range(..).expect("mapped range");
+                let words: &[u32] = cast_slice(&view);
+                if rb.queries.is_some() {
+                    let ts: Vec<u64> = (0..TIMESTAMPS as usize).map(|i| words[i * 2] as u64 | ((words[i * 2 + 1] as u64) << 32)).collect();
+                    if let Some(t) = GpuTiming::parse(rb.frame, &ts, rb.written, self.timestamp_period) {
+                        self.stats.gpu_ms = t.total_ms;
+                        if self.timings.len() >= 1024 {
+                            self.timings.drain(..512); // nobody is collecting them
                         }
+                        self.timings.push(t);
                     }
-                    self.stats.ground_light = f32::from_bits(words[16 + 15]);
-                    let mut tris = self.terrain.patch_count as u64 * PATCH_TRIS as u64;
-                    for d in 0..DRAWS {
-                        let n = words[64 + d * 5 + 1];
-                        self.stats.visible[d] = n;
-                        tris += n as u64 * self.forest.draws[d].tris as u64;
-                    }
-                    self.stats.grass = if self.settings.grass { words[124 + 1] } else { 0 };
-                    tris += self.stats.grass as u64 * 5;
-                    self.stats.tris = tris;
-                    self.stats.patches = self.terrain.patch_count;
                 }
-                rb.buf.unmap();
-                rb.state.store(0, Ordering::Release);
+                self.stats.ground_light = f32::from_bits(words[16 + 15]);
+                let mut tris = self.terrain.patch_count as u64 * PATCH_TRIS as u64;
+                for d in 0..DRAWS {
+                    let n = words[64 + d * 5 + 1];
+                    self.stats.visible[d] = n;
+                    tris += n as u64 * self.forest.draws[d].tris as u64;
+                }
+                self.stats.grass = if self.settings.grass { words[124 + 1] } else { 0 };
+                tris += self.stats.grass as u64 * 5;
+                self.stats.tris = tris;
+                self.stats.patches = self.terrain.patch_count;
             }
+            rb.buf.unmap();
+            rb.state.store(0, Ordering::Release);
         }
         self.frame_index += 1;
+    }
+
+    /// GPU timings read back since the last call, oldest first. A frame's timings arrive two
+    /// frames after it is rendered.
+    pub fn take_timings(&mut self) -> Vec<GpuTiming> {
+        std::mem::take(&mut self.timings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: u32 = (1 << TIMESTAMPS) - 1;
+    // 1000 ns per tick, so 1000 ticks are a millisecond
+    const PERIOD: f32 = 1000.0;
+    const IN_ORDER: [u64; 8] = [10_000, 10_100, 10_300, 10_600, 11_600, 11_700, 11_750, 11_800];
+
+    fn close(a: Option<f32>, b: f32) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-4)
+    }
+
+    #[test]
+    fn sections_add_up_when_in_order() {
+        let t = GpuTiming::parse(7, &IN_ORDER, ALL, PERIOD).unwrap();
+        assert!(t.ordered);
+        assert_eq!(t.frame, 7);
+        assert!(close(Some(t.total_ms), 1.8));
+        assert!(close(t.through_main_ms, 1.6));
+        for (s, want) in t.sections.iter().zip([0.1, 0.2, 0.3, 1.0, 0.1, 0.05, 0.05]) {
+            assert!(close(*s, want), "{s:?} != {want}");
+        }
+    }
+
+    #[test]
+    fn stale_end_of_frame_is_rejected() {
+        let mut ts = IN_ORDER;
+        ts[TS_POST as usize] = 9_000; // left over from an earlier frame
+        assert!(GpuTiming::parse(0, &ts, ALL, PERIOD).is_none());
+        ts[TS_POST as usize] = u64::MAX; // Metal's error value
+        assert!(GpuTiming::parse(0, &ts, ALL, PERIOD).is_none());
+        let mut ts = IN_ORDER;
+        ts[TS_START as usize] = 0;
+        assert!(GpuTiming::parse(0, &ts, ALL, PERIOD).is_none());
+    }
+
+    #[test]
+    fn untimed_ssao_counts_with_bloom() {
+        let mut ts = IN_ORDER;
+        ts[TS_SSAO as usize] = 3; // not written this frame
+        let t = GpuTiming::parse(0, &ts, ALL & !(1 << TS_SSAO), PERIOD).unwrap();
+        assert!(t.ordered);
+        assert_eq!(t.sections[TS_SSAO as usize - 1], None);
+        assert!(close(t.sections[TS_BLOOM as usize - 1], 0.15));
+        assert!(close(Some(t.total_ms), 1.8));
+    }
+
+    #[test]
+    fn invalid_timestamp_inside_the_frame_is_flagged() {
+        let mut ts = IN_ORDER;
+        ts[TS_SHADOWS as usize] = 9_000; // stale
+        let t = GpuTiming::parse(0, &ts, ALL, PERIOD).unwrap();
+        assert!(!t.ordered);
+        assert_eq!(t.sections[TS_SHADOWS as usize - 1], None);
+        assert!(close(t.sections[TS_MAIN as usize - 1], 1.3)); // shadows + main
+    }
+
+    #[test]
+    fn overlapping_passes_are_flagged_but_still_add_up() {
+        // SSAO finishes after bloom (they don't depend on each other)
+        let mut ts = IN_ORDER;
+        ts[TS_SSAO as usize] = 11_760;
+        let t = GpuTiming::parse(0, &ts, ALL, PERIOD).unwrap();
+        assert!(!t.ordered);
+        assert!(close(t.sections[TS_BLOOM as usize - 1], 0.0));
+        let sum: f32 = t.sections.iter().flatten().sum();
+        assert!((sum - t.total_ms).abs() < 1e-4);
     }
 }
