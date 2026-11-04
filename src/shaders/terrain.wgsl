@@ -20,7 +20,12 @@ fn vs(@builtin(vertex_index) vid: u32, @location(0) quad: vec4f) -> VOut {
     let k = clamp((d - m.x) / (m.y - m.x), 0.0, 1.0);
     g = g - fract(g * 0.5) * 2.0 * k;
     let p = origin + g * (size / 32.0);
-    let h = height_at(p) + detail_h(p) * (1.0 - smoothstep(80.0, 140.0, d));
+    // the detail relief is gone by 140 m: skip its noise there (most of the vertices)
+    let detail = 1.0 - smoothstep(80.0, 140.0, d);
+    var h = height_at(p);
+    if (detail > 0.0) {
+        h += detail_h(p) * detail;
+    }
     let wp = vec3f(p.x, h, p.y);
     var o: VOut;
     o.clip = P.view_proj * vec4f(wp, 1.0);
@@ -84,14 +89,17 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let fp = max(mix(sqrt(ax * ay), max(ax, ay), 0.25), 1e-4);
     let vis = sky_vis(p);
 
-    // macro normal from the baked map + procedural micro detail up close
+    // macro normal from the baked map + procedural micro detail up close; beyond 140 m the
+    // detail weighs nothing, so its eight noise lookups are skipped
     let nm = normal_at(p);
     var n = nm;
     let df = 1.0 - smoothstep(60.0, 140.0, dist);
-    let e = 0.25;
-    let hx = detail_h(p + vec2f(e, 0.0)) - detail_h(p - vec2f(e, 0.0));
-    let hz = detail_h(p + vec2f(0.0, e)) - detail_h(p - vec2f(0.0, e));
-    n = normalize(n + vec3f(-hx, 0.0, -hz) / (2.0 * e) * df);
+    if (df > 0.0) {
+        let e = 0.25;
+        let hx = detail_h(p + vec2f(e, 0.0)) - detail_h(p - vec2f(e, 0.0));
+        let hz = detail_h(p + vec2f(0.0, e)) - detail_h(p - vec2f(0.0, e));
+        n = normalize(n + vec3f(-hx, 0.0, -hz) / (2.0 * e) * df);
+    }
     let slope = 1.0 - nm.y;
 
     let forest = dat.x;
