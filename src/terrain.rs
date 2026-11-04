@@ -3,7 +3,7 @@
 
 use crate::util::*;
 use bytemuck::cast_slice;
-use glam::{Vec2, Vec4};
+use glam::{Vec2, Vec3, Vec4};
 use wgpu::*;
 
 pub const WORLD: f32 = 8192.0;
@@ -65,8 +65,7 @@ impl Terrain {
             &[
                 uniform_entry(0, ShaderStages::COMPUTE),
                 storage_texture_entry(1, TextureFormat::R32Float),
-                storage_texture_entry(2, TextureFormat::Rgba16Float),
-                storage_texture_entry(3, TextureFormat::Rgba8Unorm),
+                storage_texture_entry(2, TextureFormat::Rgba8Unorm),
             ],
         );
         let bg = bind_group(
@@ -76,13 +75,32 @@ impl Terrain {
             &[
                 params_buf.as_entire_binding(),
                 BindingResource::TextureView(&height_view),
-                BindingResource::TextureView(&normal_view),
                 BindingResource::TextureView(&data_view),
             ],
         );
         let module = shader(device, "terrain gen", &[NOISE_WGSL, include_str!("shaders/terrain_gen.wgsl")]);
         let pl = pipeline_layout(device, &[&layout]);
         let pipe = compute_pipeline(device, "terrain gen", &pl, &module, "main");
+
+        // second pass: normal map + sky visibility, read back from the finished heightmap
+        let vis_layout = bgl(
+            device,
+            "sky visibility",
+            &[
+                uniform_entry(0, ShaderStages::COMPUTE),
+                texture_entry(1, ShaderStages::COMPUTE, TextureSampleType::Float { filterable: false }, TextureViewDimension::D2),
+                storage_texture_entry(2, TextureFormat::Rgba16Float),
+                texture_entry(3, ShaderStages::COMPUTE, TextureSampleType::Float { filterable: false }, TextureViewDimension::D2),
+            ],
+        );
+        let vis_bg = bind_group(
+            device,
+            "sky visibility",
+            &vis_layout,
+            &[params_buf.as_entire_binding(), BindingResource::TextureView(&height_view), BindingResource::TextureView(&normal_view), BindingResource::TextureView(&data_view)],
+        );
+        let vis_module = shader(device, "sky visibility", &[NOISE_WGSL, include_str!("shaders/sky_vis.wgsl")]);
+        let vis_pipe = compute_pipeline(device, "sky visibility", &pipeline_layout(device, &[&vis_layout]), &vis_module, "main");
 
         let row = res * 4;
         let rb_height = buffer(device, "height readback", (row * res) as u64, BufferUsages::COPY_DST | BufferUsages::MAP_READ);
@@ -92,6 +110,12 @@ impl Terrain {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&pipe);
             cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(res.div_ceil(8), res.div_ceil(8), 1);
+        }
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&vis_pipe);
+            cp.set_bind_group(0, &vis_bg, &[]);
             cp.dispatch_workgroups(res.div_ceil(8), res.div_ceil(8), 1);
         }
         for (tex, buf) in [(&height_tex, &rb_height), (&data_tex, &rb_data)] {
@@ -291,4 +315,64 @@ impl Terrain {
     pub fn forest_at(&self, x: f32, z: f32) -> f32 {
         self.sample(x, z, |i| self.data[i * 4] as f32 / 255.0)
     }
+
+    /// Ground height as the terrain mesh draws it near the camera: heightmap plus detail
+    /// noise at the 1 m vertices of the finest CDLOD level, split into the same triangles
+    /// as the patch index buffer (each quad along its (x+1, z)-(x, z+1) diagonal).
+    pub fn ground_at(&self, x: f32, z: f32) -> f32 {
+        let (x0, z0) = (x.floor(), z.floor());
+        let (fx, fz) = (x - x0, z - z0);
+        let h = |dx: f32, dz: f32| {
+            let (px, pz) = (x0 + dx, z0 + dz);
+            self.height_at(px, pz) + detail_h(Vec2::new(px, pz))
+        };
+        let (b, c) = (h(1.0, 0.0), h(0.0, 1.0));
+        if fx + fz <= 1.0 {
+            let a = h(0.0, 0.0);
+            a + (b - a) * fx + (c - a) * fz
+        } else {
+            let d = h(1.0, 1.0);
+            d + (c - d) * (1.0 - fx) + (b - d) * (1.0 - fz)
+        }
+    }
+
+    /// Smooth surface normal from the heightmap alone, for walkable-slope tests.
+    pub fn normal_at(&self, x: f32, z: f32) -> Vec3 {
+        let e = 2.0;
+        let dx = self.height_at(x - e, z) - self.height_at(x + e, z);
+        let dz = self.height_at(x, z - e) - self.height_at(x, z + e);
+        Vec3::new(dx, 2.0 * e, dz).normalize()
+    }
+}
+
+// CPU copy of `gnoise` / `detail_h` from shaders/noise.wgsl and globals.wgsl, so the
+// player stands on the ground that is drawn. Keep the two in sync.
+
+fn pcg(v: u32) -> u32 {
+    let s = v.wrapping_mul(747796405).wrapping_add(2891336453);
+    let w = ((s >> ((s >> 28) + 4)) ^ s).wrapping_mul(277803737);
+    (w >> 22) ^ w
+}
+
+fn grad2(x: i32, y: i32) -> Vec2 {
+    let h = pcg(x as u32 ^ pcg((y as u32).wrapping_add(0x9e3779b9)));
+    let a = (h >> 8) as f32 * (1.0 / 16777216.0) * std::f32::consts::TAU;
+    Vec2::new(a.cos(), a.sin())
+}
+
+fn gnoise(p: Vec2) -> f32 {
+    let fl = p.floor();
+    let (i, j) = (fl.x as i32, fl.y as i32);
+    let f = p - fl;
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let a = grad2(i, j).dot(f);
+    let b = grad2(i + 1, j).dot(f - Vec2::X);
+    let c = grad2(i, j + 1).dot(f - Vec2::Y);
+    let d = grad2(i + 1, j + 1).dot(f - Vec2::ONE);
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y) * 1.4
+}
+
+fn detail_h(p: Vec2) -> f32 {
+    gnoise(p * 0.21) * 0.35 + gnoise(p * 0.73) * 0.12
 }

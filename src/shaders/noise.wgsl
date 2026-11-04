@@ -67,3 +67,25 @@ fn ridged(p: vec2f, octaves: i32) -> f32 {
     }
     return sum;
 }
+
+// gnoise with its analytic gradient: (value, d/dx, d/dy).
+fn gnoise_d(p: vec2f) -> vec3f {
+    let fl = floor(p);
+    let i = vec2i(fl);
+    let f = p - fl;
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    let ga = grad2(i);
+    let gb = grad2(i + vec2i(1, 0));
+    let gc = grad2(i + vec2i(0, 1));
+    let gd = grad2(i + vec2i(1, 1));
+    let va = dot(ga, f);
+    let vb = dot(gb, f - vec2f(1.0, 0.0));
+    let vc = dot(gc, f - vec2f(0.0, 1.0));
+    let vd = dot(gd, f - vec2f(1.0, 1.0));
+    let k = va - vb - vc + vd;
+    let v = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k;
+    let g = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd)
+        + du * vec2f(u.y * k + (vb - va), u.x * k + (vc - va));
+    return vec3f(v, g) * 1.4;
+}

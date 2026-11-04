@@ -1,4 +1,12 @@
-// Sky, sun disk and a drifting cloud layer, drawn behind everything (reversed-Z depth 0).
+// Sky (from the sky-view table) and the sun disk with the volumetric clouds composited over
+// them, drawn behind everything (reversed-Z depth 0). The clouds come from the
+// reduced-resolution buffer of clouds.wgsl.
+
+@group(1) @binding(0) var t_clouds: texture_2d<f32>;
+
+// The disk is drawn this much dimmer than the real sun (which would be ~10^4 times brighter
+// than the sky and overflow half floats once bloom spreads it); bloom makes up the glow.
+const SUN_DISK_SCALE: f32 = 0.04;
 
 struct VOut {
     @builtin(position) clip: vec4f,
@@ -15,38 +23,39 @@ fn vs(@builtin(vertex_index) vid: u32) -> VOut {
     return o;
 }
 
-fn cloud_density(p: vec2f) -> f32 {
-    let shape = fbm(p * 0.00042, 4);
-    let cover = mix(0.3, -0.1, F.fog.w);
-    let core = smoothstep(cover, cover + 0.22, shape);
-    // erode the edges with finer noise so they billow instead of streaking
-    let detail = fbm(p * 0.0021 + vec2f(3.0, 7.0), 4);
-    return clamp(core * 1.25 - (1.0 - core) * 0.6 + detail * 0.35 * (1.0 - core * 0.5), 0.0, 1.0);
+// The sun's disk at its real size (0.53 degrees), darker towards the limb.
+fn sun_disk(dir: vec3f) -> vec3f {
+    let L = F.sun_dir.xyz;
+    // the angle from the sun's centre; sin() of it from a cross product keeps the precision
+    // that acos(dot) loses this close to 1
+    let ang = asin(min(length(cross(dir, L)), 1.0));
+    let aa = max(fwidth(ang), 1e-5);
+    let cover = saturate((SUN_ANGULAR_R - ang) / aa + 0.5) * select(0.0, 1.0, dot(dir, L) > 0.0);
+    if (cover <= 0.0) {
+        return vec3f(0.0);
+    }
+    let x = min(ang / SUN_ANGULAR_R, 1.0);
+    let mu = sqrt(1.0 - x * x);
+    // limb darkening, u = 0.6
+    let limb = 1.0 - 0.6 * (1.0 - mu);
+    // radiance = illuminance / solid angle of the disk
+    let radiance = SKY.sun.rgb / (PI * SUN_ANGULAR_R * SUN_ANGULAR_R);
+    return radiance * limb * cover * SUN_DISK_SCALE;
 }
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
-    let pn = F.inv_view_proj * vec4f(in.ndc, 1.0, 1.0);
-    let dir = normalize(pn.xyz / pn.w - F.cam_pos.xyz);
-    var col = sky_radiance(dir);
-    let L = F.sun_dir.xyz;
-    let mu = dot(dir, L);
-    col += F.sun_color.rgb * smoothstep(0.99965, 0.9998, mu) * 30.0;
+    let pn = F.inv_view_proj_rot * vec4f(in.ndc, 1.0, 1.0);
+    let dir = normalize(pn.xyz / pn.w);
+    let sky = sky_radiance(dir);
+    var col = sky + sun_disk(dir);
 
-    if (dir.y > 0.003) {
-        let t = (2200.0 - F.cam_pos.y) / dir.y;
-        let drift = F.wind.xy * F.cam_pos.w * 8.0;
-        let cp = F.cam_pos.xz + dir.xz * t + drift;
-        let d = cloud_density(cp);
-        let d_sun = cloud_density(cp + L.xz * 350.0);
-        let lit = clamp(1.0 - (d_sun - d * 0.5) * 1.2, 0.0, 1.0);
-        let shade = mix(F.sky_horizon.rgb * 0.75 + vec3f(0.06), F.sun_color.rgb * 0.33 + F.sky_zenith.rgb * 0.25, lit);
-        let silver = F.sun_color.rgb * pow(max(mu, 0.0), 12.0) * (1.0 - d) * 0.6;
-        let cloud_col = shade * (1.0 - 0.25 * d) + silver;
-        let fade = smoothstep(0.0, 0.18, dir.y);
-        col = mix(col, cloud_col, d * fade * 0.95);
-        // haze towards the horizon
-        col = mix(col, F.sky_horizon.rgb, (1.0 - smoothstep(0.0, 0.12, dir.y)) * 0.5);
+    // rgb = light the clouds scatter towards us, a = how much of the sky shows through
+    let cl = textureSampleLevel(t_clouds, s_clamp, in.clip.xy * F.screen.zw, 0.0);
+    col = col * cl.a + cl.rgb;
+    if (dir.y > 0.0) {
+        // the most distant clouds dissolve into the haze at the horizon
+        col = mix(col, sky, (1.0 - smoothstep(0.0, 0.1, dir.y)) * 0.5);
     }
-    return vec4f(col, 1.0);
+    return vec4f(min(col, vec3f(60000.0)), 1.0);
 }

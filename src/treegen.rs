@@ -42,6 +42,10 @@ impl Mesh {
     }
 }
 
+/// Trunk radius at the ground per species (broadleaf, birch, spruce), before the
+/// per-tree scale. The player collides with trunks of this size.
+pub const TRUNK_R: [f32; 3] = [0.42, 0.22, 0.34];
+
 pub struct Species {
     pub name: &'static str,
     pub lods: Vec<Mesh>,
@@ -466,7 +470,7 @@ fn spruce(seed: u64) -> Species {
     let max_r = 4.4;
     let trunk = Branch {
         pts: (0..=12).map(|i| Vec3::new(rng.range(-0.04, 0.04), h * i as f32 / 12.0, rng.range(-0.04, 0.04))).collect(),
-        rads: (0..=12).map(|i| 0.34 * (1.0 - 0.92 * i as f32 / 12.0)).collect(),
+        rads: (0..=12).map(|i| TRUNK_R[2] * (1.0 - 0.92 * i as f32 / 12.0)).collect(),
         level: 0,
         limb: 0,
     };
@@ -603,7 +607,7 @@ pub fn build_all() -> Vec<Species> {
     let oak = Params {
         height: 18.0,
         trunk_frac: 0.38,
-        trunk_r: 0.42,
+        trunk_r: TRUNK_R[0],
         children: [(2, 3), (5, 7), (4, 6)],
         child_start: [0.55, 0.2, 0.2],
         angle: [(0.5, 0.9), (0.6, 1.1), (0.5, 1.0)],
@@ -618,7 +622,7 @@ pub fn build_all() -> Vec<Species> {
     let birch = Params {
         height: 17.0,
         trunk_frac: 1.0,
-        trunk_r: 0.22,
+        trunk_r: TRUNK_R[1],
         children: [(12, 16), (4, 6), (3, 5)],
         child_start: [0.32, 0.2, 0.25],
         angle: [(0.55, 0.85), (0.5, 0.9), (0.6, 1.1)],

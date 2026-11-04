@@ -1,14 +1,25 @@
-// Tonemapping and final grade from the HDR buffer to the swapchain.
+// Bloom, exposure, tonemapping and final grade from the HDR buffer to the swapchain.
 
 struct Post {
     exposure: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: f32,
+    bloom: f32,      // how much of the bloom is mixed in
+    bloom_norm: f32, // 1 / number of bloom levels summed
+    key: f32,        // light on flat ground at which `exposure` applies unchanged
+}
+
+struct SkyLight {
+    sun: vec4f,
+    amb_up: vec4f,
+    amb_ground: vec4f,
+    horizon: vec4f, // w = illuminance on flat ground
 }
 
 @group(0) @binding(0) var t_hdr: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> PP: Post;
+@group(0) @binding(2) var t_bloom: texture_2d<f32>;
+@group(0) @binding(3) var s_lin: sampler;
+@group(0) @binding(4) var<uniform> SKY: SkyLight;
+@group(0) @binding(5) var t_ao: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) clip: vec4f,
@@ -36,7 +47,15 @@ fn aces(x: vec3f) -> vec3f {
 @fragment
 fn fs(in: VOut) -> @location(0) vec4f {
     let px = vec2i(in.clip.xy);
-    var c = textureLoad(t_hdr, px, 0).rgb * PP.exposure;
+    var c = textureLoad(t_hdr, px, 0).rgb;
+    // ambient occlusion (ssao.wgsl), already limited to the ambient share of the light
+    c *= textureSampleLevel(t_ao, s_lin, in.uv, 0.0).r;
+    let bloom = textureSampleLevel(t_bloom, s_lin, in.uv, 0.0).rgb * PP.bloom_norm;
+    c = mix(c, bloom, PP.bloom);
+    // partial eye adaptation: open up as the light falls towards sunset, but only by about
+    // the square root, so dusk still looks darker than noon
+    let adapt = clamp(pow(PP.key / max(SKY.horizon.w, 1e-4), 0.5), 0.5, 4.0);
+    c *= PP.exposure * adapt;
     c = aces(c);
     // gentle saturation lift and vignette
     let l = dot(c, vec3f(0.2126, 0.7152, 0.0722));

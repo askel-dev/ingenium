@@ -18,7 +18,7 @@ struct VOut {
     @location(1) nrm: vec3f,
     @location(2) uv: vec2f,
     @location(3) @interpolate(flat) info: vec4u,   // species, kind, seed, lod
-    @location(4) misc: vec4f,                      // ao, sway, local height
+    @location(4) misc: vec4f,                      // ao, sway, local height, stand tint
 }
 
 @vertex
@@ -63,7 +63,9 @@ fn vs(v: VIn) -> VOut {
     o.nrm = n;
     o.uv = v.uv;
     o.info = vec4u(species, u32(v.attr.x + 0.5), seed, lod);
-    o.misc = vec4f(v.attr.z, sway, v.pos.y, 0.0);
+    // neighbouring trees look alike (same soil, same age), so part of the colour varies by stand
+    let stand = gnoise(base.xz * 0.012 + vec2f(3.3, -8.1)) * 0.6 + gnoise(base.xz * 0.05) * 0.4;
+    o.misc = vec4f(v.attr.z, sway, v.pos.y, stand);
     return o;
 }
 
@@ -98,10 +100,16 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let species = in.info.x;
     let kind = in.info.y;
     let seed = in.info.z;
-    let tint_r = u01(pcg(seed * 7u + 3u));
-    let tint_y = u01(pcg(seed * 13u + 5u));
-    var tint = mix(vec3f(0.62, 0.72, 0.58), vec3f(1.05, 1.0, 0.86), tint_r);
-    tint = mix(tint, tint * vec3f(1.25, 1.1, 0.7), smoothstep(0.8, 1.0, tint_y));
+    // Per-tree colour: brightness, a hue between blue-green and yellow-green, the odd tree
+    // that is paler or turning early, and a stand-wide shift shared with its neighbours.
+    let r1 = u01(pcg(seed * 7u + 3u));
+    let r2 = u01(pcg(seed * 13u + 5u));
+    let r3 = u01(pcg(seed * 29u + 11u));
+    let stand = in.misc.w;
+    var tint = vec3f(mix(0.66, 1.12, r1));
+    tint *= mix(vec3f(0.84, 1.0, 1.18), vec3f(1.22, 1.06, 0.68), saturate(r2 * 0.8 + stand * 0.35 + 0.1));
+    tint *= mix(0.86, 1.12, stand * 0.5 + 0.5);
+    tint = mix(tint, tint * vec3f(1.55, 1.2, 0.5), smoothstep(0.93, 1.0, r3) * 0.75);
     var n = normalize(in.nrm);
     let L = F.sun_dir.xyz;
     let V = normalize(F.cam_pos.xyz - in.wp);
@@ -124,13 +132,28 @@ fn fs(in: VOut) -> @location(0) vec4f {
     if (kind == 2u) {
         sh = mix(sh, 1.0, 0.4);
     }
+    // the baked sky visibility is for the ground: up in the crown much more of the sky is open
+    let up = saturate(in.misc.z / 12.0);
+    let vis = mix(sky_vis(in.wp.xz), 1.0, select(up * 0.85, 0.75, kind == 2u));
+    let amb = ambient_vis(n, in.wp, vis);
+    let sun = sun_light(in.wp);
     var col: vec3f;
     if (kind == 0u) {
-        col = albedo * (F.sun_color.rgb * max(dot(n, L), 0.0) * sh + ambient(n) * ao);
+        col = albedo * (sun * max(dot(n, L), 0.0) * sh + amb * ao);
     } else {
         let wrap = max((dot(n, L) + 0.45) / 1.45, 0.0);
         let trans = pow(max(dot(-V, L), 0.0), 5.0) * 0.3;
-        col = albedo * (F.sun_color.rgb * (wrap * 0.95 + trans) * sh * mix(0.45, 1.0, ao) + ambient(n) * ao);
+        col = albedo * (sun * (wrap * 0.95 + trans) * sh * mix(0.45, 1.0, ao) + amb * ao);
+        // Leaves are waxy: a soft, broad highlight from the sun (the normals are rounded over
+        // the crown, so it lands where the crown faces between sun and eye) and a sky sheen
+        // at grazing angles. Uncoloured, as on any dielectric.
+        // (a rough surface: the Fresnel rise towards grazing angles is mostly lost)
+        let H = normalize(L + V);
+        let ndv = saturate(dot(n, V));
+        let fres = 0.04 + 0.16 * pow(1.0 - ndv, 4.0);
+        let spec = pow(max(dot(n, H), 0.0), 12.0) * fres * max(dot(n, L), 0.0);
+        let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * fres * 0.35;
+        col += (sun * spec * sh + sheen * ao) * select(1.0, 0.5, kind == 2u);
     }
     if (F.debug.x > 0.5) {
         col = mix(col, lod_tint(in.info.w) * 0.3, 0.6);

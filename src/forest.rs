@@ -10,7 +10,7 @@ use wgpu::*;
 pub const SPECIES: usize = 3;
 pub const LODS: usize = 4;
 pub const DRAWS: usize = 12; // 3 species * 4 LODs (fits the 12-entry uniform arrays)
-const SCATTER_CELL: f32 = 5.5;
+pub const SCATTER_CELL: f32 = 5.5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -51,6 +51,7 @@ pub struct Forest {
     pipe_color: RenderPipeline,
     pipe_shadow: RenderPipeline,
     bounds: [Vec4; 4],
+    trees_buf: Buffer,
 }
 
 pub struct ViewSetup {
@@ -97,7 +98,7 @@ impl Forest {
         // ---- scatter
         let dim = (world / SCATTER_CELL) as u32;
         let cap = dim * dim;
-        let trees_buf = buffer(device, "trees", cap as u64 * 16, BufferUsages::STORAGE);
+        let trees_buf = buffer(device, "trees", cap as u64 * 16, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
         let counter = buffer(device, "tree counter", 4, BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST);
         let counter_rb = buffer(device, "tree counter rb", 4, BufferUsages::COPY_DST | BufferUsages::MAP_READ);
         let sp: [u32; 4] = [SCATTER_CELL.to_bits(), dim, cap, 0];
@@ -223,7 +224,20 @@ impl Forest {
             cache: None,
         });
 
-        Forest { vbuf, ibuf, draws, tree_count, views, cull_pipe, tree_bg, pipe_color, pipe_shadow, bounds }
+        Forest { vbuf, ibuf, draws, tree_count, views, cull_pipe, tree_bg, pipe_color, pipe_shadow, bounds, trees_buf }
+    }
+
+    /// One-time copy of the tree records (see scatter.wgsl) to the CPU, for trunk collision.
+    pub fn read_trees(&self, device: &Device, queue: &Queue) -> Vec<[u32; 4]> {
+        let size = self.tree_count as u64 * 16;
+        if size == 0 {
+            return Vec::new();
+        }
+        let rb = buffer(device, "trees rb", size, BufferUsages::COPY_DST | BufferUsages::MAP_READ);
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.trees_buf, 0, &rb, 0, size);
+        queue.submit([enc.finish()]);
+        read_buffer_blocking(device, &rb, size).as_chunks::<16>().0.iter().map(|c| bytemuck::cast(*c)).collect()
     }
 
     pub fn update_view(&self, queue: &Queue, view: usize, setup: &ViewSetup) {

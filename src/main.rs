@@ -1,20 +1,26 @@
 //! ingenium: a small GPU-driven forest renderer.
 //!
 //!   cargo run --release                       window, cinematic flythrough
-//!   cargo run --release -- --capture out.png  headless screenshot (+ --time, --size, --atmos, --cam)
+//!   cargo run --release -- --capture out.png  headless screenshot (+ --time, --size, --atmos, --cam, --no-ao)
 
+mod bloom;
 mod camera;
+mod clouds;
 mod forest;
 mod gpu;
 mod grass;
 mod leaftex;
+mod player;
 mod renderer;
+mod sky;
+mod ssao;
 mod terrain;
 mod treegen;
 mod util;
 
 use camera::{Camera, FlyPath};
 use glam::Vec3;
+use player::{Input, Player, Trunks};
 use renderer::Renderer;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -45,10 +51,12 @@ struct Args {
     height: u32,
     frames: u32,
     atmos: usize,
+    sun_shift: f32,
     cam: Option<(Vec3, f32, f32)>,
     msaa: u32,
     vsync: bool,
     lod_tint: bool,
+    ssao: bool,
     leaf_png: Option<String>,
 }
 
@@ -60,10 +68,12 @@ fn parse_args() -> Args {
         height: 900,
         frames: 30,
         atmos: 1,
+        sun_shift: 0.0,
         cam: None,
         msaa: 4,
         vsync: true,
         lod_tint: false,
+        ssao: true,
         leaf_png: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -75,6 +85,7 @@ fn parse_args() -> Args {
             "--time" => { a.time = next(i).parse().unwrap_or(a.time); i += 1; }
             "--frames" => { a.frames = next(i).parse().unwrap_or(a.frames); i += 1; }
             "--atmos" => { a.atmos = next(i).parse().unwrap_or(a.atmos); i += 1; }
+            "--sun-shift" => { a.sun_shift = next(i).parse().unwrap_or(a.sun_shift); i += 1; }
             "--msaa" => { a.msaa = next(i).parse().unwrap_or(a.msaa); i += 1; }
             "--size" => {
                 let s = next(i);
@@ -93,6 +104,7 @@ fn parse_args() -> Args {
             }
             "--novsync" => a.vsync = false,
             "--lod-tint" => a.lod_tint = true,
+            "--no-ao" => a.ssao = false,
             "--leaf-png" => { a.leaf_png = Some(next(i)); i += 1; }
             other => eprintln!("unknown argument: {other}"),
         }
@@ -113,8 +125,10 @@ fn main() {
         return;
     }
     println!(
-        "controls: Tab cinematic/fly · click to grab mouse, Esc to release · WASD move, Space/E up, Q/C down, Shift fast\n\
-         \x20         1-4 time of day · F freeze culling · L LOD colours · G grass · F11 fullscreen · P print camera"
+        "controls: Tab cinematic/player · click to grab mouse, Esc to release · V walk/fly\n\
+         \x20 walk:    WASD move, Space jump, Shift sprint, Ctrl/C crouch\n\
+         \x20 fly:     WASD move, Space/E up, Q/C down, Shift fast, Ctrl slow\n\
+         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · G grass · F11 fullscreen · P print camera"
     );
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App { args, state: None };
@@ -127,10 +141,18 @@ fn capture(args: &Args) {
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut r = Renderer::new(&gpu.device, &gpu.queue, gpu.timestamps, args.width, args.height, fmt, args.msaa);
     r.settings.atmos = args.atmos;
+    r.settings.sun_shift = args.sun_shift;
     r.settings.lod_tint = args.lod_tint;
+    r.settings.ssao = args.ssao;
     let path = FlyPath::new(&r.terrain);
     let cam = match args.cam {
-        Some((p, yaw, pitch)) => Camera { pos: p, yaw, pitch, fov_y: FOV_Y },
+        // a negative height means that far above the ground
+        Some((mut p, yaw, pitch)) => {
+            if p.y < 0.0 {
+                p.y = r.terrain.ground_at(p.x, p.z) - p.y;
+            }
+            Camera { pos: p, yaw, pitch, fov_y: FOV_Y }
+        }
         None => path.camera(args.time, &r.terrain, FOV_Y),
     };
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -185,7 +207,10 @@ fn capture(args: &Args) {
         "captured {out} ({}x{}) cam=({:.1},{:.1},{:.1}) yaw={:.3} pitch={:.3}\n  gpu {:.2} ms (median) · {}",
         args.width, args.height, cam.pos.x, cam.pos.y, cam.pos.z, cam.yaw, cam.pitch, med, stats_line(&r)
     );
-    println!("  passes: cull+grass {:.2} · shadows {:.2} · main {:.2} · post {:.2} ms", s.pass_ms[0], s.pass_ms[1], s.pass_ms[2], s.pass_ms[3]);
+    println!(
+        "  passes: cull+grass {:.2} · sky+clouds {:.2} · shadows {:.2} · main {:.2} ms · ground light {:.2}",
+        s.pass_ms[0], s.pass_ms[1], s.pass_ms[2], s.pass_ms[3], s.ground_light
+    );
 }
 
 fn fmt_count(n: u64) -> String {
@@ -226,6 +251,8 @@ struct State {
     renderer: Renderer,
     path: FlyPath,
     cam: Camera,
+    player: Player,
+    trunks: Trunks,
     cinematic: bool,
     cine_time: f32,
     keys: HashSet<KeyCode>,
@@ -261,9 +288,12 @@ impl App {
         surface.configure(&gpu.device, &config);
         let mut renderer = Renderer::new(&gpu.device, &gpu.queue, gpu.timestamps, config.width, config.height, format, self.args.msaa);
         renderer.settings.atmos = self.args.atmos;
+        renderer.settings.sun_shift = self.args.sun_shift;
         renderer.settings.lod_tint = self.args.lod_tint;
+        renderer.settings.ssao = self.args.ssao;
         let path = FlyPath::new(&renderer.terrain);
         let cam = path.camera(self.args.time, &renderer.terrain, FOV_Y);
+        let trunks = Trunks::new(&renderer.forest.read_trees(&gpu.device, &gpu.queue), renderer.terrain.world);
         let now = Instant::now();
         self.state = Some(State {
             window,
@@ -273,6 +303,8 @@ impl App {
             renderer,
             path,
             cam,
+            player: Player::new(),
+            trunks,
             cinematic: true,
             cine_time: self.args.time,
             keys: HashSet::new(),
@@ -302,45 +334,60 @@ impl State {
     }
 
     fn update(&mut self, dt: f32) {
+        // hold [ / ] to move the sun down / up through the day, 8 degrees a second
+        let sun = self.keys.contains(&KeyCode::BracketRight) as i32 - self.keys.contains(&KeyCode::BracketLeft) as i32;
+        if sun != 0 {
+            let s = &mut self.renderer.settings;
+            s.sun_shift = (s.sun_shift + sun as f32 * 8.0 * dt).clamp(-60.0, 60.0);
+        }
         if self.cinematic {
             self.cine_time += dt;
             self.cam = self.path.camera(self.cine_time, &self.renderer.terrain, FOV_Y);
             return;
         }
         let k = |c: KeyCode| self.keys.contains(&c);
-        let mut speed = 25.0;
-        if k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight) {
-            speed *= 6.0;
+        let axis = |pos: bool, neg: bool| pos as i32 as f32 - neg as i32 as f32;
+        let input = Input {
+            forward: axis(k(KeyCode::KeyW), k(KeyCode::KeyS)),
+            right: axis(k(KeyCode::KeyD), k(KeyCode::KeyA)),
+            up: axis(k(KeyCode::Space) || k(KeyCode::KeyE), k(KeyCode::KeyQ) || k(KeyCode::KeyC)),
+            sprint: k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight),
+            crouch: k(KeyCode::ControlLeft) || k(KeyCode::ControlRight) || (!self.player.fly && k(KeyCode::KeyC)),
+        };
+        self.player.update(&input, dt, &self.renderer.terrain, &self.trunks);
+        self.cam = self.player.camera(FOV_Y);
+    }
+
+    fn leave_cinematic(&mut self) {
+        self.cinematic = false;
+        self.player.take_over(&self.cam, &self.renderer.terrain, &self.trunks);
+        println!("{} (click to grab the mouse, V to switch)", self.mode_name());
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match (self.cinematic, self.player.fly) {
+            (true, _) => "cinematic",
+            (false, false) => "walk",
+            (false, true) => "fly",
         }
-        if k(KeyCode::ControlLeft) {
-            speed *= 0.2;
-        }
-        let f = self.cam.forward();
-        let r = self.cam.right();
-        let mut mv = Vec3::ZERO;
-        if k(KeyCode::KeyW) { mv += f; }
-        if k(KeyCode::KeyS) { mv -= f; }
-        if k(KeyCode::KeyD) { mv += r; }
-        if k(KeyCode::KeyA) { mv -= r; }
-        if k(KeyCode::Space) || k(KeyCode::KeyE) { mv += Vec3::Y; }
-        if k(KeyCode::KeyQ) || k(KeyCode::KeyC) { mv -= Vec3::Y; }
-        if mv.length_squared() > 0.0 {
-            self.cam.pos += mv.normalize() * speed * dt;
-        }
-        let w = self.renderer.terrain.world;
-        self.cam.pos.x = self.cam.pos.x.clamp(1.0, w - 1.0);
-        self.cam.pos.z = self.cam.pos.z.clamp(1.0, w - 1.0);
-        let g = self.renderer.terrain.height_at(self.cam.pos.x, self.cam.pos.z);
-        self.cam.pos.y = self.cam.pos.y.max(g + 1.7);
     }
 
     fn key(&mut self, code: KeyCode, el: &ActiveEventLoop) {
         let s = &mut self.renderer.settings;
         match code {
             KeyCode::Tab => {
-                self.cinematic = !self.cinematic;
-                println!("{}", if self.cinematic { "cinematic camera" } else { "free fly (click to grab the mouse)" });
+                if self.cinematic {
+                    self.leave_cinematic();
+                } else {
+                    self.cinematic = true;
+                    println!("cinematic");
+                }
             }
+            KeyCode::KeyV if !self.cinematic => {
+                self.player.set_fly(!self.player.fly);
+                println!("{}", self.mode_name());
+            }
+            KeyCode::Space if !self.cinematic && !self.player.fly => self.player.jump(),
             KeyCode::Escape => {
                 if self.grabbed {
                     self.set_grab(false);
@@ -348,10 +395,15 @@ impl State {
                     el.exit();
                 }
             }
-            KeyCode::Digit1 => s.atmos = 0,
-            KeyCode::Digit2 => s.atmos = 1,
-            KeyCode::Digit3 => s.atmos = 2,
-            KeyCode::Digit4 => s.atmos = 3,
+            KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4 => {
+                s.atmos = match code {
+                    KeyCode::Digit1 => 0,
+                    KeyCode::Digit2 => 1,
+                    KeyCode::Digit3 => 2,
+                    _ => 3,
+                };
+                s.sun_shift = 0.0;
+            }
             KeyCode::KeyF => {
                 s.freeze = !s.freeze;
                 println!("culling {}", if s.freeze { "FROZEN: fly away to see what the GPU kept" } else { "live" });
@@ -362,6 +414,7 @@ impl State {
                 self.window.set_fullscreen(if full { None } else { Some(winit::window::Fullscreen::Borderless(None)) });
             }
             KeyCode::KeyG => s.grass = !s.grass,
+            KeyCode::KeyO => s.ssao = !s.ssao,
             KeyCode::KeyP => {
                 let c = self.cam;
                 println!("--cam {:.1},{:.1},{:.1},{:.3},{:.3}", c.pos.x, c.pos.y, c.pos.z, c.yaw, c.pitch);
@@ -400,7 +453,8 @@ impl State {
             let fps = n / self.frame_times.iter().sum::<f32>();
             let cpu = self.cpu_times.iter().sum::<f32>() / n;
             let title = format!(
-                "ingenium · {:.1} fps · cpu {:.2} ms · gpu {:.2} ms · {} · {}",
+                "ingenium · {} · {:.1} fps · cpu {:.2} ms · gpu {:.2} ms · {} · {}",
+                self.mode_name(),
                 fps,
                 cpu,
                 self.renderer.stats.gpu_ms,
@@ -452,7 +506,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if !st.grabbed {
                     if st.cinematic {
-                        st.cinematic = false;
+                        st.leave_cinematic();
                     }
                     st.set_grab(true);
                 }
@@ -470,8 +524,7 @@ impl ApplicationHandler for App {
         let Some(st) = self.state.as_mut() else { return };
         if let DeviceEvent::MouseMotion { delta } = event {
             if st.grabbed && !st.cinematic {
-                st.cam.yaw += delta.0 as f32 * 0.0022;
-                st.cam.pitch = (st.cam.pitch - delta.1 as f32 * 0.0022).clamp(-1.5, 1.5);
+                st.player.look(delta.0 as f32, delta.1 as f32);
             }
         }
     }

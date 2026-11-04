@@ -4,7 +4,9 @@ use wgpu::util::DeviceExt;
 use wgpu::*;
 
 pub const NOISE_WGSL: &str = include_str!("shaders/noise.wgsl");
-pub const GLOBALS_WGSL: &str = include_str!("shaders/globals.wgsl");
+pub const ATMO_WGSL: &str = include_str!("shaders/atmo_common.wgsl");
+/// The per-frame globals; they read the atmosphere tables, so they bring the atmosphere code along.
+pub const GLOBALS_WGSL: &str = concat!(include_str!("shaders/atmo_common.wgsl"), include_str!("shaders/globals.wgsl"));
 
 pub fn uniform_entry(binding: u32, visibility: ShaderStages) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {

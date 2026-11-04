@@ -53,13 +53,15 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let t = in.misc.x;
     let flower = in.misc.y;
     let rnd = in.misc.z;
-    let dat = data_at(in.wp.xz);
-    let patchy = gnoise(in.wp.xz * 0.11) * 0.5 + 0.5;
-    var tip = mix(vec3f(0.045, 0.09, 0.015), vec3f(0.10, 0.14, 0.03), clamp(dat.w * 0.5 + rnd * 0.3 + patchy * 0.4 - 0.1, 0.0, 1.0));
+    let p = in.wp.xz;
+    let dat = data_at(p);
+    // the same tint as the ground the blades fade into further out, a bit brighter since
+    // the ground's colour averages in the gaps between blades
+    var tip = meadow_tint(p, dat, normal_at(p), sky_vis(p)) * (1.1 + 0.55 * rnd);
     tip = mix(tip, vec3f(0.17, 0.15, 0.06), smoothstep(0.82, 1.0, rnd) * 0.6);
     var albedo = mix(vec3f(0.02, 0.038, 0.009), tip, smoothstep(0.0, 0.85, t));
     if (flower > 0.5 && t > 0.85) {
-        albedo = select(vec3f(0.85, 0.82, 0.70), vec3f(0.95, 0.66, 0.08), flower < 1.5);
+        albedo = flower_color(p) * 1.1;
     }
     let n = normalize(in.nrm);
     let L = F.sun_dir.xyz;
@@ -68,7 +70,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let wrap = max((dot(n, L) + 0.4) / 1.4, 0.0);
     let trans = pow(max(dot(-V, L), 0.0), 4.0) * 0.5 * t;
     let ao = mix(0.2, 1.0, t * t);
-    var col = albedo * (F.sun_color.rgb * (wrap + trans) * sh * ao + ambient(n) * ao);
+    var col = albedo * (sun_light(in.wp) * (wrap + trans) * sh * ao + ambient(n, in.wp) * ao);
     col = apply_fog(col, in.wp);
     return vec4f(col, 1.0);
 }

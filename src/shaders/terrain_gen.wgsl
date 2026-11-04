@@ -1,5 +1,5 @@
-// One-time terrain generation: height, normal and a "world data" map
-// (forest density, rock, flowers, colour variation).
+// One-time terrain generation: height and a "world data" map (forest density, rock,
+// flowers, colour variation). The normal map and sky visibility follow in sky_vis.wgsl.
 
 struct GenParams {
     world: f32,
@@ -10,8 +10,7 @@ struct GenParams {
 
 @group(0) @binding(0) var<uniform> G: GenParams;
 @group(0) @binding(1) var o_height: texture_storage_2d<r32float, write>;
-@group(0) @binding(2) var o_normal: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(3) var o_data: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(2) var o_data: texture_storage_2d<rgba8unorm, write>;
 
 fn bump(p: vec2f, c: vec2f, r: f32) -> f32 {
     let d = (p - c) / r;
@@ -67,6 +66,5 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let ip = vec2i(id.xy);
     textureStore(o_height, ip, vec4f(h, 0.0, 0.0, 0.0));
-    textureStore(o_normal, ip, vec4f(n, 0.0));
     textureStore(o_data, ip, vec4f(forest, rock, flowers, variation));
 }

@@ -67,7 +67,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let width = 0.032 * (1.0 + d3 / radius * 3.0) * mix(0.8, 1.2, u01(h0));
         let angle = u01(h5) * TAU;
         var flower = 0.0;
-        if (u01(h6) < dat.z * 0.16) {
+        if (u01(h6) < dat.z * flower_drift(p) * 0.22) {
             flower = 1.0 + f32(h6 & 1u);
         }
         let slot = atomicAdd(&args[1], 1u);
