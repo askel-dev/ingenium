@@ -180,7 +180,9 @@ pub struct Stats {
     pub visible: [u32; DRAWS],
     pub grass: u32,
     pub tris: u64,
-    pub patches: u32,
+    /// Terrain patches picked by the LOD selection, then drawn by the camera, the near and
+    /// the far shadow cascade.
+    pub patches: [u32; 4],
 }
 
 // GPU timestamps of a timed frame, in submission order: the start of the frame, then the
@@ -698,12 +700,13 @@ impl Renderer {
         }
         queue.write_buffer(&self.post_buf, 0, cast_slice(&[atm.exposure, BLOOM, 1.0 / self.bloom.levels() as f32, EXPOSURE_KEY]));
 
-        self.terrain.select(queue, Vec2::new(ref_pos.x, ref_pos.z), MAX_TREE_DIST * 0.6);
+        let shadow_planes = [frustum_planes(svp0), frustum_planes(svp1)];
+        self.terrain.select(queue, Vec2::new(ref_pos.x, ref_pos.z), MAX_TREE_DIST * 0.6, &[cull_planes, shadow_planes[0], shadow_planes[1]]);
         self.forest.update_view(queue, 0, &ViewSetup { planes: cull_planes, ref_pos, max_dist: MAX_TREE_DIST, lod: LOD_DIST });
-        for (i, svp) in [svp0, svp1].iter().enumerate() {
+        for (i, planes) in shadow_planes.iter().enumerate() {
             let mut lod = LOD_DIST;
             lod.w = [0.0f32, 3.0][i]; // far cascade casts from the cheap hull LOD only
-            self.forest.update_view(queue, 1 + i, &ViewSetup { planes: frustum_planes(*svp), ref_pos, max_dist: CASCADES[i].1 + 60.0, lod });
+            self.forest.update_view(queue, 1 + i, &ViewSetup { planes: *planes, ref_pos, max_dist: CASCADES[i].1 + 60.0, lod });
         }
         self.grass.update(queue, cull_planes, ref_pos);
         self.clouds.update(queue, vp_rot, cam, sun, fu.cloud_shadow, fu.clouds);
@@ -755,7 +758,7 @@ impl Renderer {
             });
             rp.set_bind_group(0, &self.global_bg_shadow, &[]);
             rp.set_bind_group(1, &self.pass_bgs[1 + c], &[]);
-            self.terrain.draw(&mut rp, true);
+            self.terrain.draw(&mut rp, 1 + c);
             rp.set_bind_group(2, &self.pass_bgs[1 + c], &[]);
             self.forest.draw(&mut rp, 1 + c, true, 3);
         }
@@ -783,7 +786,7 @@ impl Renderer {
             });
             rp.set_bind_group(0, &self.global_bg, &[]);
             rp.set_bind_group(1, &self.pass_bgs[0], &[]);
-            self.terrain.draw(&mut rp, false);
+            self.terrain.draw(&mut rp, 0);
             self.terrain.draw_canopy(&mut rp);
             rp.set_bind_group(2, &self.pass_bgs[0], &[]);
             self.forest.draw(&mut rp, 0, false, 3);
@@ -876,7 +879,7 @@ impl Renderer {
                     }
                 }
                 self.stats.ground_light = f32::from_bits(words[16 + 15]);
-                let mut tris = self.terrain.patch_count as u64 * PATCH_TRIS as u64;
+                let mut tris = self.terrain.drawn(0) as u64 * PATCH_TRIS as u64;
                 for d in 0..DRAWS {
                     let n = words[64 + d * 5 + 1];
                     self.stats.visible[d] = n;
@@ -885,7 +888,7 @@ impl Renderer {
                 self.stats.grass = if self.settings.grass { words[124 + 1] } else { 0 };
                 tris += self.stats.grass as u64 * 5;
                 self.stats.tris = tris;
-                self.stats.patches = self.terrain.patch_count;
+                self.stats.patches = [self.terrain.selected, self.terrain.drawn(0), self.terrain.drawn(1), self.terrain.drawn(2)];
             }
             rb.buf.unmap();
             rb.state.store(0, Ordering::Release);

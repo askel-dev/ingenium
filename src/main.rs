@@ -229,6 +229,8 @@ fn capture(args: &Args) {
         .map(|(i, name)| format!("{name} {}", ms(median(split.iter().filter_map(|t| t.sections[i])))))
         .collect();
     println!("  passes (median ms): {}{note} · ground light {:.2}", passes.join(" · "), r.stats.ground_light);
+    let p = r.stats.patches;
+    println!("  terrain patches: {} picked by LOD · drawn by the camera {} · near cascade {} · far cascade {}", p[0], p[1], p[2], p[3]);
 }
 
 /// The median (upper, for an even count), or None if there are no values.

@@ -47,8 +47,8 @@ Command-line options: `--novsync` (benchmark), `--msaa 1|4`, `--atmos 0-3`, `--s
 and headless screenshots with `--capture out.png [--time 60] [--cam x,y,z,yaw,pitch] [--lod-tint] [--no-ao] [--frames 30]`
 (a negative camera height in `--cam` means that many metres above the ground). A capture renders
 `--frames` frames of the same view and prints the median GPU time over the second half of them:
-the whole frame, the span through the main pass and each pass (cull + grass, sky + clouds,
-shadows, main, SSAO, bloom, post).
+the whole frame, the span through the main pass, each pass (cull + grass, sky + clouds, shadows,
+main, SSAO, bloom, post) and how many terrain patches each view drew.
 
 ## How it works
 
@@ -80,6 +80,7 @@ Every frame:
    and a haze level.
 4. **Shadows**: two cascades. The near one renders full leaf cards with alpha test, which
    gives the dappled light under the canopy. The far one only renders the cheap canopy hulls.
+   Each cascade draws only the terrain patches inside its box (see below).
 5. **Main pass** (HDR, 4× MSAA with alpha-to-coverage for leaves): CDLOD terrain, the far
    canopy shell, 12 indirect draws for all trees, grass, then the sky with the clouds
    composited over it. Ambient light everywhere is scaled by a **sky visibility** map baked
@@ -106,7 +107,7 @@ Pieces worth reading:
 | `src/treegen.rs` | procedural trees (oak-ish, birch, spruce). One branch skeleton per species, 4 LODs: full branches + ~1000 leaf cards → fewer cards → huge cards + hull → a 80-triangle "union of spheres" canopy hull |
 | `shaders/tree.wgsl` | tree shading: per-tree brightness and hue (blue-green to yellow-green, the odd early-turning tree) plus a shift shared by neighbouring trees, translucency, and a soft waxy highlight and sky sheen on the leaves |
 | `src/leaftex.rs` | foliage textures painted in code; mipmaps keep alpha-test coverage so canopies don't thin out with distance |
-| `src/terrain.rs`, `shaders/terrain.wgsl` | heightmap generated on the GPU; CDLOD quadtree patches that morph between levels (no cracks, no popping); the **canopy shell**: the terrain lifted by forest density and shaded as treetops, standing in for every tree beyond ~1.3 km |
+| `src/terrain.rs`, `shaders/terrain.wgsl` | heightmap generated on the GPU; CDLOD quadtree patches that morph between levels (no cracks, no popping), picked once per frame by distance, then culled against the camera and each shadow cascade using min/max height bounds per quadtree node; the **canopy shell**: the terrain lifted by forest density and shaded as treetops, standing in for every tree beyond ~1.3 km |
 | `shaders/terrain.wgsl`, `globals.wgsl` (`meadow_tint`) | the ground material: dry and lush stretches (drier on raised, open or steep ground, lusher in hollows), clumps, drifts of buttercups, daisies or clover painted as dots that fade to their average colour with distance, bare soil on slopes and worn patches, and sward relief at four scales that fades with the pixel's footprint. A grass sward isn't a flat surface, so the ground darkens when seen from above (gaps between blades), brightens at grazing angles, has a hot spot with the sun behind the viewer and glows against the sun. The grass blades take their colour from the same function, so they blend into the ground. |
 | `src/clouds.rs`, `shaders/clouds.wgsl` | volumetric clouds: noise baking, the weather-driven density, lighting and the temporal reprojection; the cloud shadow map; each time-of-day preset sets the layer height, coverage and cloud types |
 | `src/sky.rs`, `shaders/atmosphere.wgsl`, `shaders/aerial.wgsl` | the atmosphere tables, the sun and ambient light, and the aerial perspective volume |

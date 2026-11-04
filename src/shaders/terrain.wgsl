@@ -173,6 +173,7 @@ struct CanopyOut {
     @location(1) ground: f32,
 }
 
+// At most 15.5 * (0.85 + 0.25 * 0.75) = 16.1 m; SHELL_PAD in terrain.rs culls with that.
 fn shell_height(p: vec2f) -> f32 {
     let forest = data_at(p).x;
     let crowns = gnoise(p * 0.19) * 0.5 + gnoise(p * 0.43) * 0.25;

@@ -1,5 +1,7 @@
 //! Procedural terrain: generated once on the GPU, rendered with CDLOD
 //! (quadtree patches whose vertices morph smoothly between detail levels).
+//! The patches are picked by distance once per frame, then each view (the camera and the
+//! shadow cascades) draws only those whose height bounds touch its frustum.
 
 use crate::util::*;
 use bytemuck::cast_slice;
@@ -11,8 +13,20 @@ pub const HM_RES: u32 = 2048;
 const LEAF: f32 = 32.0;
 const PATCH_N: u32 = 32;
 pub const LEVELS: usize = 9;
-const MAX_PATCHES: usize = 4096;
+/// Most patches in one list.
+const MAX_PATCHES: usize = 2048;
 pub const PATCH_TRIS: u32 = PATCH_N * PATCH_N * 2;
+/// Views the patches are culled for: the camera, then the two shadow cascades.
+pub const VIEWS: usize = 3;
+/// Patch lists in the instance buffer: one per view, then the camera's far canopy shell.
+const LISTS: usize = VIEWS + 1;
+const SHELL: usize = VIEWS;
+/// Furthest the detail noise (`detail_h`, at most ~0.47 m) moves a vertex off the
+/// heightmap, with margin.
+const DETAIL_PAD: f32 = 1.0;
+/// Highest the canopy shell rises above the ground (`shell_height` in terrain.wgsl,
+/// at most 16.1 m), with margin.
+const SHELL_PAD: f32 = 17.0;
 
 pub struct Terrain {
     pub world: f32,
@@ -23,11 +37,15 @@ pub struct Terrain {
     _textures: Vec<Texture>,
     heights: Vec<f32>,
     data: Vec<u8>,
+    /// Lowest and highest ground under each quadtree node, per level (level 0 first).
+    bounds: Vec<Vec<[f32; 2]>>,
     index_buf: Buffer,
     index_count: u32,
     patch_buf: Buffer,
-    pub patch_count: u32,
-    pub shell_count: u32,
+    /// Patches the distance-based LOD selection picked this frame, before culling.
+    pub selected: u32,
+    /// (first instance, count) of each list in `patch_buf`.
+    lists: [(u32, u32); LISTS],
     ranges: [f32; LEVELS],
     pipe: Option<RenderPipeline>,
     pipe_shadow: Option<RenderPipeline>,
@@ -146,7 +164,8 @@ impl Terrain {
             }
         }
         let index_buf = buffer_init(device, "terrain idx", cast_slice(&idx), BufferUsages::INDEX);
-        let patch_buf = buffer(device, "terrain patches", (MAX_PATCHES * 16) as u64, BufferUsages::VERTEX | BufferUsages::COPY_DST);
+        let patch_buf = buffer(device, "terrain patches", (LISTS * MAX_PATCHES * 16) as u64, BufferUsages::VERTEX | BufferUsages::COPY_DST);
+        let bounds = height_bounds(&heights, res);
 
         let mut ranges = [0.0; LEVELS];
         for (l, r) in ranges.iter_mut().enumerate() {
@@ -165,11 +184,12 @@ impl Terrain {
             _textures: vec![height_tex, normal_tex, data_tex],
             heights,
             data,
+            bounds,
             index_buf,
             index_count: idx.len() as u32,
             patch_buf,
-            patch_count: 0,
-            shell_count: 0,
+            selected: 0,
+            lists: [(0, 0); LISTS],
             ranges,
             pipe: None,
             pipe_shadow: None,
@@ -243,34 +263,66 @@ impl Terrain {
         }));
     }
 
-    /// Pick quadtree patches around `cam`; patches reaching beyond `shell_from` metres
-    /// are also listed (after the regular ones) for the far canopy shell.
-    pub fn select(&mut self, queue: &Queue, cam: Vec2, shell_from: f32) {
-        let mut patches: Vec<[f32; 4]> = Vec::with_capacity(1024);
-        self.select_node(0.0, 0.0, LEVELS - 1, cam, &mut patches);
-        patches.truncate(MAX_PATCHES / 2);
-        self.patch_count = patches.len() as u32;
-        let shell: Vec<[f32; 4]> = patches
-            .iter()
-            .filter(|q| {
-                let far = Vec2::new((cam.x - q[0]).abs().max((cam.x - q[0] - q[2]).abs()), (cam.y - q[1]).abs().max((cam.y - q[1] - q[2]).abs()));
-                far.length() > shell_from
-            })
-            .copied()
-            .collect();
-        self.shell_count = shell.len() as u32;
-        patches.extend(shell);
-        queue.write_buffer(&self.patch_buf, 0, cast_slice(&patches));
+    /// Pick quadtree patches around `cam` by distance, then list for each view only the
+    /// patches whose bounds touch its frustum (`views`: the camera, then the shadow
+    /// cascades). The level of detail does not depend on the view, so every pass draws the
+    /// same surface and the morphing stays crack-free. Patches reaching beyond `shell_from`
+    /// metres are also listed for the camera's far canopy shell.
+    pub fn select(&mut self, queue: &Queue, cam: Vec2, shell_from: f32, views: &[[Vec4; 6]; VIEWS]) {
+        let mut picked: Vec<[f32; 4]> = Vec::with_capacity(1024);
+        self.select_node(0.0, 0.0, LEVELS - 1, cam, &mut picked);
+        picked.truncate(MAX_PATCHES);
+        self.selected = picked.len() as u32;
+        let mut lists: [Vec<[f32; 4]>; LISTS] = Default::default();
+        for q in &picked {
+            let (lo, hi) = self.patch_box(q);
+            for (v, planes) in views.iter().enumerate() {
+                if !outside(planes, lo, hi) {
+                    lists[v].push(*q);
+                }
+            }
+            let far = Vec2::new((cam.x - q[0]).abs().max((cam.x - q[0] - q[2]).abs()), (cam.y - q[1]).abs().max((cam.y - q[1] - q[2]).abs()));
+            if far.length() > shell_from && !outside(&views[0], lo, hi + Vec3::Y * SHELL_PAD) {
+                lists[SHELL].push(*q);
+            }
+        }
+        let mut all: Vec<[f32; 4]> = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+        for (range, list) in self.lists.iter_mut().zip(&lists) {
+            *range = (all.len() as u32, list.len() as u32);
+            all.extend_from_slice(list);
+        }
+        if !all.is_empty() {
+            queue.write_buffer(&self.patch_buf, 0, cast_slice(&all));
+        }
+    }
+
+    /// Patches drawn this frame by view `view` (0 camera, 1 and 2 the shadow cascades).
+    pub fn drawn(&self, view: usize) -> u32 {
+        self.lists[view].1
+    }
+
+    /// World-space box around everything a patch can draw: the heightmap texels its
+    /// vertices interpolate (wherever morphing moves them inside the patch) plus the detail
+    /// noise.
+    fn patch_box(&self, q: &[f32; 4]) -> (Vec3, Vec3) {
+        let level = q[3] as usize;
+        let n = (WORLD / LEAF) as usize >> level;
+        let (i, j) = ((q[0] / q[2]) as usize, (q[1] / q[2]) as usize);
+        let [lo, hi] = self.bounds[level][j.min(n - 1) * n + i.min(n - 1)];
+        // a little slack for rounding in the vertex positions
+        let m = 0.25;
+        (Vec3::new(q[0] - m, lo - DETAIL_PAD, q[1] - m), Vec3::new(q[0] + q[2] + m, hi + DETAIL_PAD, q[1] + q[2] + m))
     }
 
     pub fn draw_canopy(&self, pass: &mut RenderPass<'_>) {
-        if self.shell_count == 0 {
+        let (first, count) = self.lists[SHELL];
+        if count == 0 {
             return;
         }
         pass.set_pipeline(self.pipe_canopy.as_ref().unwrap());
         pass.set_vertex_buffer(0, self.patch_buf.slice(..));
         pass.set_index_buffer(self.index_buf.slice(..), IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, self.patch_count..self.patch_count + self.shell_count);
+        pass.draw_indexed(0..self.index_count, 0, first..first + count);
     }
 
     fn select_node(&self, x: f32, z: f32, level: usize, cam: Vec2, out: &mut Vec<[f32; 4]>) {
@@ -287,12 +339,17 @@ impl Terrain {
         }
     }
 
-    pub fn draw(&self, pass: &mut RenderPass<'_>, shadow: bool) {
-        let pipe = if shadow { &self.pipe_shadow } else { &self.pipe };
+    /// Draw the patches listed for `view`: 0 is the camera, 1 and 2 the shadow cascades.
+    pub fn draw(&self, pass: &mut RenderPass<'_>, view: usize) {
+        let (first, count) = self.lists[view];
+        if count == 0 {
+            return;
+        }
+        let pipe = if view == 0 { &self.pipe } else { &self.pipe_shadow };
         pass.set_pipeline(pipe.as_ref().unwrap());
         pass.set_vertex_buffer(0, self.patch_buf.slice(..));
         pass.set_index_buffer(self.index_buf.slice(..), IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, 0..self.patch_count);
+        pass.draw_indexed(0..self.index_count, 0, first..first + count);
     }
 
     fn sample<F: Fn(usize) -> f32>(&self, x: f32, z: f32, f: F) -> f32 {
@@ -345,6 +402,59 @@ impl Terrain {
     }
 }
 
+/// Lowest and highest heightmap value under every quadtree node, level 0 (the finest
+/// patches) first. A level-0 node spans every texel `height_at` in globals.wgsl reads for a
+/// point of the patch: its bilinear lookup between texel centres reaches one texel beyond
+/// the patch on each side.
+fn height_bounds(heights: &[f32], res: u32) -> Vec<Vec<[f32; 2]>> {
+    let res = res as i32;
+    let per = (LEAF / (WORLD / res as f32)) as i32;
+    let n0 = (WORLD / LEAF) as usize;
+    let span = |i: usize| ((i as i32 * per - 1).max(0), ((i as i32 + 1) * per).min(res - 1));
+    let mut level0 = vec![[0.0f32; 2]; n0 * n0];
+    for j in 0..n0 {
+        let (z0, z1) = span(j);
+        for i in 0..n0 {
+            let (x0, x1) = span(i);
+            let mut b = [f32::MAX, f32::MIN];
+            for z in z0..=z1 {
+                let row = (z * res) as usize;
+                for &h in &heights[row + x0 as usize..=row + x1 as usize] {
+                    b = [b[0].min(h), b[1].max(h)];
+                }
+            }
+            level0[j * n0 + i] = b;
+        }
+    }
+    let mut levels = vec![level0];
+    for l in 1..LEVELS {
+        let (prev, pn) = (&levels[l - 1], n0 >> (l - 1));
+        let n = pn / 2;
+        let mut cur = vec![[0.0f32; 2]; n * n];
+        for j in 0..n {
+            for i in 0..n {
+                let mut b = [f32::MAX, f32::MIN];
+                for (di, dj) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let c = prev[(2 * j + dj) * pn + 2 * i + di];
+                    b = [b[0].min(c[0]), b[1].max(c[1])];
+                }
+                cur[j * n + i] = b;
+            }
+        }
+        levels.push(cur);
+    }
+    levels
+}
+
+/// True if the box lies wholly on the outside of one of the planes (inside: dot(n, p) + d >= 0).
+fn outside(planes: &[Vec4; 6], lo: Vec3, hi: Vec3) -> bool {
+    planes.iter().any(|p| {
+        // the corner furthest along the plane normal
+        let c = Vec3::new(if p.x > 0.0 { hi.x } else { lo.x }, if p.y > 0.0 { hi.y } else { lo.y }, if p.z > 0.0 { hi.z } else { lo.z });
+        p.truncate().dot(c) + p.w < 0.0
+    })
+}
+
 // CPU copy of `gnoise` / `detail_h` from shaders/noise.wgsl and globals.wgsl, so the
 // player stands on the ground that is drawn. Keep the two in sync.
 
@@ -375,4 +485,69 @@ fn gnoise(p: Vec2) -> f32 {
 
 fn detail_h(p: Vec2) -> f32 {
     gnoise(p * 0.21) * 0.35 + gnoise(p * 0.73) * 0.12
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rough random heightmap.
+    fn heightmap(res: u32) -> Vec<f32> {
+        (0..res * res).map(|i| (pcg(i) % 100_000) as f32 * 0.01).collect()
+    }
+
+    /// `height_at` from globals.wgsl.
+    fn height_at(heights: &[f32], res: u32, p: Vec2) -> f32 {
+        let t = WORLD / res as f32;
+        let uv = p / t - 0.5;
+        let fl = uv.floor();
+        let f = uv - fl;
+        let max = res as i32 - 1;
+        let at = |x: i32, z: i32| heights[(z.clamp(0, max) * res as i32 + x.clamp(0, max)) as usize];
+        let (i, j) = (fl.x as i32, fl.y as i32);
+        let top = at(i, j) + (at(i + 1, j) - at(i, j)) * f.x;
+        let bot = at(i, j + 1) + (at(i + 1, j + 1) - at(i, j + 1)) * f.x;
+        top + (bot - top) * f.y
+    }
+
+    #[test]
+    fn height_bounds_hold_every_sampled_height() {
+        let heights = heightmap(HM_RES);
+        let bounds = height_bounds(&heights, HM_RES);
+        assert_eq!(bounds.len(), LEVELS);
+        assert_eq!(bounds[LEVELS - 1].len(), 1);
+        for (level, b) in bounds.iter().enumerate() {
+            let size = LEAF * (1u32 << level) as f32;
+            let n = (WORLD / size) as usize;
+            assert_eq!(b.len(), n * n);
+            for k in 0..2000u32 {
+                // points of random patches, including their edges and corners
+                let h = pcg(k * 7919 + level as u32);
+                let (i, j) = ((h % n as u32) as f32, ((h >> 12) % n as u32) as f32);
+                let fx = [0.0, 1.0, (pcg(h) % 1000) as f32 / 1000.0][k as usize % 3];
+                let fz = [1.0, 0.0, (pcg(h + 1) % 1000) as f32 / 1000.0][k as usize % 3];
+                let p = Vec2::new((i + fx) * size, (j + fz) * size);
+                let y = height_at(&heights, HM_RES, p);
+                let [lo, hi] = b[j as usize * n + i as usize];
+                assert!(y >= lo - 1e-3 && y <= hi + 1e-3, "level {level} patch ({i}, {j}) at {p}: {y} outside {lo}..{hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn boxes_outside_a_frustum_are_culled() {
+        let m = glam::camera::rh::proj::directx::orthographic(-10.0, 10.0, -10.0, 10.0, 0.0, 100.0) * glam::camera::rh::view::look_to_mat4(Vec3::new(0.0, 50.0, 0.0), Vec3::NEG_Y, Vec3::Z);
+        let planes = frustum_planes(m);
+        let unit = |c: Vec3| (c - Vec3::ONE, c + Vec3::ONE);
+        let (lo, hi) = unit(Vec3::ZERO);
+        assert!(!outside(&planes, lo, hi));
+        let (lo, hi) = unit(Vec3::new(30.0, 0.0, 0.0));
+        assert!(outside(&planes, lo, hi));
+        // straddling an edge counts as inside
+        let (lo, hi) = unit(Vec3::new(10.5, 0.0, 0.0));
+        assert!(!outside(&planes, lo, hi));
+        // beyond the far plane
+        let (lo, hi) = unit(Vec3::new(0.0, -60.0, 0.0));
+        assert!(outside(&planes, lo, hi));
+    }
 }
