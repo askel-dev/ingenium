@@ -20,6 +20,10 @@ struct Frame {
     cloud_type: vec4f,   // x, y range of cloud type (0 stratus .. 1 cumulus), z drift speed (m/s)
     cloud_shadow: vec4f, // cloud shadow map: xy centre (m), z 1 / extent, w value beyond the map
     morph: array<vec4f, 12>,
+    // The canopy light volume (canopy.rs), per level: xz of its first voxel (m), voxel size (m),
+    // first row in the stacked textures; [4]: y range above the terrain (m), z unused, w levels
+    // in use (0: off).
+    canopy: array<vec4f, 5>,
 }
 
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -44,6 +48,12 @@ struct Frame {
 // The foliage's normals (foliage.rs): normal xy (+x along u, +y along v), roughness, translucency.
 // (t_leaf, binding 7, holds its albedo and coverage.)
 @group(0) @binding(18) var t_leaf_n: texture_2d_array<f32>;
+// The canopy light volume (canopy.wgsl): rows 0-119 the SH of the sky the leaves let through,
+// rows 120-239 the leaves' light and the sun's transmittance. Repeats in x and z, clamps in y.
+@group(0) @binding(19) var t_canopy: texture_3d<f32>;
+@group(0) @binding(20) var s_canopy: sampler;
+// unfiltered, for gathering the heightmap (height_fast)
+@group(0) @binding(21) var s_point: sampler;
 
 // Aerial perspective volume (aerial.wgsl): froxels over the screen, slice i at distance
 // AP_DIST * ((i + 0.5) / slices)^2, so the near slices are finer.
@@ -81,6 +91,15 @@ fn height_at(p: vec2f) -> f32 {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
+// height_at from one gather of the four texels instead of four loads
+fn height_fast(p: vec2f) -> f32 {
+    let uv = p / F.world.z - 0.5;
+    let fl = floor(uv);
+    let f = uv - fl;
+    let g = textureGather(0, t_height, s_point, (fl + 1.0) / F.world.y);
+    return mix(mix(g.w, g.z, f.x), mix(g.x, g.y, f.x), f.y);
+}
+
 fn detail_h(p: vec2f) -> f32 {
     return gnoise(p * 0.21) * 0.35 + gnoise(p * 0.73) * 0.12;
 }
@@ -93,9 +112,10 @@ fn data_at(p: vec2f) -> vec4f {
     return textureSampleLevel(t_data, s_clamp, p / F.world.x, 0.0);
 }
 
-// macro terrain normal (w of the map holds the sky visibility)
+// macro terrain normal (the map holds its x and z; z and w the sky visibility, sky_vis.wgsl)
 fn normal_at(p: vec2f) -> vec3f {
-    return normalize(textureSampleLevel(t_normal, s_clamp, p / F.world.x, 0.0).xyz);
+    let m = textureSampleLevel(t_normal, s_clamp, p / F.world.x, 0.0).xy;
+    return normalize(vec3f(m.x, sqrt(max(1.0 - dot(m, m), 0.0)), m.y));
 }
 
 fn cam_radius() -> f32 {
@@ -166,6 +186,11 @@ fn sky_vis(p: vec2f) -> f32 {
     return textureSampleLevel(t_normal, s_clamp, p / F.world.x, 0.0).w;
 }
 
+// The same for the terrain alone, without the forest.
+fn sky_vis_ground(p: vec2f) -> f32 {
+    return textureSampleLevel(t_normal, s_clamp, p / F.world.x, 0.0).z;
+}
+
 // Light from the sky and the ground, plus what clouds above wp scatter down, for a point
 // that sees `vis` of the sky. The part of the sky that is blocked by hills and trees is
 // replaced by what those send back: lit ground, partly in shade.
@@ -191,7 +216,173 @@ fn ambient_vis(n: vec3f, wp: vec3f, vis: f32) -> vec3f {
 const CANOPY_TRANSMIT: vec3f = vec3f(0.07, 0.13, 0.03);
 
 fn ambient(n: vec3f, wp: vec3f) -> vec3f {
-    return ambient_vis(n, wp, sky_vis(wp.xz));
+    return ambient_c(n, wp, canopy_sample(wp, n));
+}
+
+// ---------------------------------------------------------------------------
+// The canopy light volume (canopy.rs, canopy.wgsl): a clipmap of 4 levels of 128 x 128 voxels
+// (1, 2, 4, 8 m across, at most C_DY tall) around the camera, following the terrain from C_Y0
+// to C_Y1 m above it. The levels are stacked in y, and wrap around in x and z: world voxel i is
+// texel i mod 128.
+
+const C_LEVELS: u32 = 4u;
+const C_N: f32 = 128.0;
+const C_NY: f32 = 120.0;
+const C_DY: f32 = 2.0;
+const C_Y0: f32 = -4.0;
+const C_Y1: f32 = 44.0;
+// A level hands over to the next between these distances from its centre (in half-widths),
+// short of its edge, where its texels wrap around.
+const C_BLEND0: f32 = 0.78;
+const C_BLEND1: f32 = 0.92;
+// Beyond the volume the leaves that block the sky are taken as this much sunlit and sky-lit.
+const C_FALLBACK_LIT: f32 = 0.45;
+// Leaves deep in a canopy are lit less by the sun and sky than by the light the leaves around
+// them scatter, which the volume doesn't follow: the share of the rest that reaches them anyway.
+const CANOPY_MS: f32 = 0.45;
+// Share of the light falling on a canopy that the leaves that block a point's sky send on to
+// it, through them and off them (with C_FALLBACK_LIT, CANOPY_TRANSMIT beyond the volume).
+const CANOPY_SCATTER: vec3f = CANOPY_TRANSMIT * 2.2;
+
+// How far p is from level l's centre, in half-widths (beyond 1: outside it).
+fn c_edge(l: u32, p: vec2f) -> f32 {
+    let L = F.canopy[l];
+    let half = 0.5 * C_N * L.z;
+    let d = abs(p - (L.xy + half)) / half;
+    return max(d.x, d.y);
+}
+
+// The finest level from `first` on that holds p within `edge` half-widths; C_LEVELS if none.
+fn c_level_at(p: vec2f, first: u32, edge: f32) -> u32 {
+    var l = first;
+    while (l < C_LEVELS && c_edge(l, p) >= edge) {
+        l++;
+    }
+    return l;
+}
+
+// Level l's voxel height (m).
+fn c_dy(l: u32) -> f32 {
+    return min(F.canopy[l].z, C_DY);
+}
+
+// Level l's texture coordinates at p (h: the terrain height under p): x and z wrap, y in texels
+// of the stacked rows, kept half a texel inside the level's own.
+fn c_coords(l: u32, p: vec3f, h: f32) -> vec3f {
+    let L = F.canopy[l];
+    let dy = c_dy(l);
+    let rows = (C_Y1 - C_Y0) / dy;
+    let y = clamp((p.y - h - C_Y0) / dy, 0.5, rows - 0.5) + L.w;
+    return vec3f(p.x / (L.z * C_N), y, p.z / (L.z * C_N));
+}
+
+// 0.6 of level l's voxel out along n
+fn c_offset(l: u32, n: vec3f) -> vec3f {
+    return n * vec3f(F.canopy[l].z, c_dy(l), F.canopy[l].z) * 0.6;
+}
+
+// What the shading needs from the volume at a point.
+struct Canopy {
+    sh: vec4f,     // SH-L1 (1, x, y, z) of the sky the leaves let through, over the upper hemisphere
+    lit: vec3f,    // x sunlit, y sky-lit share of the leaves that block the sky; z sun transmittance
+    w: f32,        // 1 inside the volume, fading to 0 beyond it
+    vis_g: f32,    // share of the sky the terrain leaves open (the 2D bake)
+    vis_fb: f32,   // share of the rest the forest leaves open, beyond the volume (the 2D bake)
+}
+
+fn c_fetch(l: u32, p: vec3f, h: f32) -> array<vec4f, 2> {
+    let c = c_coords(l, p, h);
+    let a = textureSampleLevel(t_canopy, s_canopy, vec3f(c.x, c.y / (2.0 * C_NY), c.z), 0.0);
+    let b = textureSampleLevel(t_canopy, s_canopy, vec3f(c.x, (c.y + C_NY) / (2.0 * C_NY), c.z), 0.0);
+    return array<vec4f, 2>(a, b);
+}
+
+// The volume at wp, for a surface facing n: looked up 0.6 voxels out along n, so that a surface
+// isn't shaded by the leaves or bark it is part of. Beyond the volume (or with it off), the 2D
+// bake's guess.
+fn canopy_sample(wp: vec3f, n: vec3f) -> Canopy {
+    var c: Canopy;
+    let bake = textureSampleLevel(t_normal, s_clamp, wp.xz / F.world.x, 0.0);
+    c.vis_g = bake.z;
+    c.vis_fb = saturate(bake.w / max(bake.z, 0.05));
+    c.sh = vec4f(0.0);
+    c.lit = vec3f(1.0);
+    c.w = 0.0;
+    let count = u32(F.canopy[4].w);
+    if (count == 0u) {
+        return c;
+    }
+    let l = c_level_at(wp.xz, 0u, C_BLEND1);
+    if (l >= count) {
+        return c;
+    }
+    let t = smoothstep(C_BLEND0, C_BLEND1, c_edge(l, wp.xz));
+    let p = wp + c_offset(l, n);
+    let h = height_fast(p.xz);
+    var s = c_fetch(l, p, h);
+    var w = 1.0;
+    if (t > 0.0) {
+        if (l + 1u < count) {
+            let s2 = c_fetch(l + 1u, wp + c_offset(l + 1u, n), h);
+            s = array<vec4f, 2>(mix(s[0], s2[0], t), mix(s[1], s2[1], t));
+        } else {
+            w = 1.0 - t;
+        }
+    }
+    c.sh = s[0];
+    c.lit = s[1].xyz;
+    c.w = w;
+    return c;
+}
+
+// Share of the sky (canopy only, not the terrain) seen by a surface facing n: the irradiance
+// from the SH over that of an open upper hemisphere, pi/2 (1 + n.y).
+fn canopy_vis(c: Canopy, n: vec3f) -> f32 {
+    let e = PI * 0.282095 * c.sh.x + (TAU / 3.0) * 0.488603 * dot(c.sh.yzw, n);
+    let open = 0.5 * PI * (1.0 + n.y);
+    let v = saturate((e + 0.1) / (open + 0.1));
+    return mix(c.vis_fb, v, c.w);
+}
+
+// Sunlight that gets through the leaves, for beyond the shadow cascades.
+fn canopy_sun(c: Canopy) -> f32 {
+    return mix(1.0, c.lit.z, c.w);
+}
+
+// Light from the sky and the ground, plus what clouds above wp scatter down (as ambient_vis),
+// with the sky blocked by the terrain and by the leaves told apart: the terrain sends back
+// ground light, the leaves what they let through and scatter of the sun and sky on them.
+fn ambient_c(n: vec3f, wp: vec3f, c: Canopy) -> vec3f {
+    let up = n.y * 0.5 + 0.5;
+    let bounce = SKY.amb_ground.rgb;
+    let cs = cloud_shadow(wp);
+    let vc = canopy_vis(c, n);
+    let vg = c.vis_g;
+    let sun_above = SKY.sun.rgb * max(F.sun_dir.y, 0.0) * cs.x;
+    let lit = mix(vec2f(C_FALLBACK_LIT), mix(c.lit.xy, vec2f(1.0), CANOPY_MS), c.w);
+    let leaves = (sun_above * lit.x / PI + SKY.amb_up.rgb * lit.y) * CANOPY_SCATTER;
+    let from_above = SKY.amb_up.rgb * vg * vc + bounce * 0.5 * (1.0 - vg) + leaves * vg * (1.0 - vc);
+    let sky = mix(bounce, from_above, up) * F.sun_color.w;
+    let cloud = SKY.sun.rgb * max(F.sun_dir.y, 0.0) * cs.y * up * vg * vc;
+    return sky + cloud;
+}
+
+// The whole share of the sky a surface facing n sees: terrain and canopy.
+fn canopy_sky(c: Canopy, n: vec3f) -> f32 {
+    return c.vis_g * canopy_vis(c, n);
+}
+
+// The `K` views: the sky a surface sees (as a share of what an open, upward surface gets),
+// and the sun that gets through the leaves.
+fn canopy_debug(col: vec3f, c: Canopy, n: vec3f) -> vec3f {
+    let mode = u32(F.debug.y + 0.5);
+    if (mode == 2u) {
+        return vec3f(canopy_sky(c, n) * (0.5 + 0.5 * n.y)) * 0.12;
+    }
+    if (mode == 3u) {
+        return vec3f(canopy_sun(c)) * 0.12;
+    }
+    return col;
 }
 
 // Aerial perspective: the air and ground haze between the camera and wp, from the volume
@@ -222,7 +413,9 @@ fn shadow_sample(ci: i32, wp: vec3f) -> f32 {
     return s / 9.0;
 }
 
-fn shadow_at(wp: vec3f, n: vec3f) -> f32 {
+// The sun's shadow at wp; `far` is what to use beyond the cascades (the sun the canopy volume
+// lets through, canopy_sun).
+fn shadow_at(wp: vec3f, n: vec3f, far: f32) -> f32 {
     let d = distance(wp, F.cam_pos.xyz);
     if (d < F.cascade.x) {
         let s0 = shadow_sample(0, wp + n * F.cascade.z * 1.5);
@@ -231,9 +424,9 @@ fn shadow_at(wp: vec3f, n: vec3f) -> f32 {
     }
     if (d < F.cascade.y) {
         let s = shadow_sample(1, wp + n * F.cascade.w * 1.5);
-        return mix(s, 1.0, smoothstep(F.cascade.y * 0.75, F.cascade.y, d));
+        return mix(s, far, smoothstep(F.cascade.y * 0.75, F.cascade.y, d));
     }
-    return 1.0;
+    return far;
 }
 
 fn lod_tint(lod: u32) -> vec3f {

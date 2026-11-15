@@ -3,6 +3,7 @@
 
 use crate::bloom::Bloom;
 use crate::camera::Camera;
+use crate::canopy::{self, Canopy};
 use crate::clouds::Clouds;
 use crate::forest::{Forest, TreePass, ViewSetup, CULL_PLANES, DRAWS, LODS, LOD_DIST, OCCLUDER_LODS};
 use crate::hiz::Hiz;
@@ -54,6 +55,7 @@ struct FrameUniform {
     cloud_type: Vec4,
     cloud_shadow: Vec4,
     morph: [Vec4; 12],
+    canopy: [Vec4; canopy::LEVELS + 1],
 }
 
 #[repr(C)]
@@ -180,6 +182,9 @@ pub struct Settings {
     pub occlusion: bool,
     /// Where the camera's trees switch to their second mesh and to impostors (`--lod`).
     pub lod: [f32; 2],
+    /// The canopy light volume (`K`, `--no-canopy`): 0 on, 1 off, 2 show the share of the sky
+    /// each surface sees, 3 show the sun the leaves let through.
+    pub canopy: u32,
 }
 
 #[derive(Default, Clone)]
@@ -202,18 +207,19 @@ pub struct Stats {
 // end of each section in GPU_SECTIONS.
 const TS_START: u32 = 0;
 const TS_CULL: u32 = 1;
-const TS_CLOUDS: u32 = 2;
-const TS_SHADOWS: u32 = 3;
-const TS_MAIN: u32 = 4;
-const TS_SSAO: u32 = 5;
-const TS_BLOOM: u32 = 6;
-const TS_POST: u32 = 7;
-const TIMESTAMPS: u32 = 8;
+const TS_CANOPY: u32 = 2;
+const TS_CLOUDS: u32 = 3;
+const TS_SHADOWS: u32 = 4;
+const TS_MAIN: u32 = 5;
+const TS_SSAO: u32 = 6;
+const TS_BLOOM: u32 = 7;
+const TS_POST: u32 = 8;
+const TIMESTAMPS: u32 = 9;
 /// What each timed section covers. A section runs from the end of the one before it, so
 /// the atmosphere tables count with the clouds and the near cascade with the shadows. The
 /// first covers the culling, the grass and, with occlusion culling, the occluder pass, the
 /// depth pyramid and the second culling pass.
-pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+occluders", "sky+clouds", "shadows", "main", "ssao", "bloom", "post"];
+pub const GPU_SECTIONS: [&str; TIMESTAMPS as usize - 1] = ["cull+occluders", "canopy", "sky+clouds", "shadows", "main", "ssao", "bloom", "post"];
 
 /// GPU time of one frame, from its timestamps.
 #[derive(Clone, Copy, Debug)]
@@ -226,8 +232,8 @@ pub struct GpuTiming {
     /// before SSAO, bloom and post were timed (to compare with older measurements).
     pub through_main_ms: Option<f32>,
     /// Time each section of GPU_SECTIONS adds after the ones before it finished. None if
-    /// its timestamp was not taken (SSAO off) or came back invalid; its time then counts
-    /// with the next section.
+    /// its timestamp was not taken (SSAO or the canopy volume off) or came back invalid; its
+    /// time then counts with the next section.
     pub sections: [Option<f32>; TIMESTAMPS as usize - 1],
     /// Every timestamp taken came back valid and in submission order, so the sections add
     /// up to the total.
@@ -328,6 +334,7 @@ pub struct Renderer {
     grass: Grass,
     undergrowth: Undergrowth,
     clouds: Clouds,
+    canopy: Canopy,
     timestamp_period: f32,
     readbacks: Vec<Readback>,
     /// Timed frames read back since the last `take_timings`.
@@ -484,6 +491,7 @@ impl Renderer {
         let materials = Materials::new(device, queue);
         let composed = foliage_job.join().expect("foliage thread");
         let foliage = Foliage::upload(device, queue, &composed);
+        let leaf_cover = composed.leaf_cover();
         drop(composed);
 
         let all = ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::COMPUTE;
@@ -512,6 +520,11 @@ impl Renderer {
                 texture_entry(16, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
                 sampler_entry(17, ShaderStages::FRAGMENT, SamplerBindingType::Filtering),
                 texture_entry(18, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
+                // The canopy light volume. The grass is lit per vertex, so every stage sees it;
+                // with the impostor atlases the trees' fragment stage is at 16 sampled textures.
+                texture_entry(19, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D3),
+                sampler_entry(20, all, SamplerBindingType::Filtering),
+                sampler_entry(21, all, SamplerBindingType::NonFiltering),
             ],
         );
         let clouds = Clouds::new(device, queue, &global_bgl, width, height);
@@ -599,7 +612,8 @@ impl Renderer {
             min_filter: FilterMode::Linear,
             ..Default::default()
         });
-        let make_global = |shadow_view: &TextureView, cloud_shadow: &TextureView, ap_scat: &TextureView, ap_trans: &TextureView| {
+        let mut canopy = Canopy::new(device);
+        let make_global = |shadow_view: &TextureView, cloud_shadow: &TextureView, ap_scat: &TextureView, ap_trans: &TextureView, canopy_light: &TextureView| {
             bind_group(
                 device,
                 "global",
@@ -624,12 +638,16 @@ impl Renderer {
                     BindingResource::TextureView(&materials.view_b),
                     BindingResource::Sampler(&s_mat),
                     BindingResource::TextureView(&foliage.view_b),
+                    BindingResource::TextureView(canopy_light),
+                    BindingResource::Sampler(&canopy.sampler),
+                    BindingResource::Sampler(&canopy.point_sampler),
                 ],
             )
         };
-        let global_bg = make_global(&shadow_array, &clouds.shadow_view, &sky.ap_scat_view, &sky.ap_trans_view);
-        // for the passes that write the sun shadow map, the cloud shadow map or the aerial volume
-        let global_bg_shadow = make_global(&dummy_view, &dummy_2d_view, &dummy_3d_view, &dummy_3d_view);
+        let global_bg = make_global(&shadow_array, &clouds.shadow_view, &sky.ap_scat_view, &sky.ap_trans_view, &canopy.light_view);
+        // for the passes that write the sun shadow map, the cloud shadow map, the aerial volume
+        // or the canopy light volume
+        let global_bg_shadow = make_global(&dummy_view, &dummy_2d_view, &dummy_3d_view, &dummy_3d_view, &dummy_3d_view);
 
         let pass_bufs: Vec<Buffer> = (0..3)
             .map(|_| buffer(device, "pass", std::mem::size_of::<PassUniform>() as u64, BufferUsages::UNIFORM | BufferUsages::COPY_DST))
@@ -643,8 +661,9 @@ impl Renderer {
 
         let mut terrain = terrain;
         terrain.create_pipelines(device, &global_bgl, &pass_bgl, HDR, msaa);
-        let mut forest = Forest::new(device, queue, &global_bgl, &global_bg, &pass_bgl, HDR, msaa, WORLD);
+        let mut forest = Forest::new(device, queue, &global_bgl, &global_bg, &pass_bgl, HDR, msaa, WORLD, &leaf_cover);
         let undergrowth = Undergrowth::new(device, &global_bgl, &forest);
+        canopy.init(device, queue, &global_bgl, &forest.trees_buf, forest.tree_count, &forest.density, WORLD, terrain.max_height());
         let grass = Grass::new(device, &global_bgl, &pass_bgl, HDR, msaa);
 
         // sky
@@ -748,13 +767,14 @@ impl Renderer {
             grass,
             undergrowth,
             clouds,
+            canopy,
             timestamp_period: queue.get_timestamp_period(),
             readbacks,
             timings: Vec::new(),
             frame_index: 0,
             stats: Stats::default(),
             frozen: None,
-            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true, prepass: true, occlusion: true, lod: LOD_DIST },
+            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true, prepass: true, occlusion: true, lod: LOD_DIST, canopy: 0 },
             _foliage: foliage,
             _materials: materials,
             _dummies: [dummy_shadow, dummy_2d, dummy_3d],
@@ -820,6 +840,8 @@ impl Renderer {
         };
 
         let wind_dir = Vec2::new(0.8, 0.6).normalize();
+        let canopy_on = self.settings.canopy != 1;
+        let canopy_levels = self.canopy.update(queue, cam.pos, sun, self.settings.atmos, canopy_on);
         let fu = FrameUniform {
             view_proj,
             inv_view_proj_rot,
@@ -834,11 +856,12 @@ impl Renderer {
             world: Vec4::new(WORLD, HM_RES as f32, WORLD / HM_RES as f32, SHADOW_RES as f32),
             cascade: Vec4::new(CASCADES[0].1, CASCADES[1].1, texel0, texel1),
             lod: Vec4::new(self.settings.lod[0], self.settings.lod[1], 0.0, MAX_TREE_DIST),
-            debug: Vec4::new(if self.settings.lod_tint { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
+            debug: Vec4::new(if self.settings.lod_tint { 1.0 } else { 0.0 }, self.settings.canopy as f32, 0.0, 0.0),
             clouds: Vec4::new(atm.cloud_base, atm.cloud_top, atm.cloud_cover, atm.cloud_density),
             cloud_type: Vec4::new(atm.cloud_type.0, atm.cloud_type.1, atm.wind * 9.0, 0.0),
             cloud_shadow: Clouds::shadow_params(cam.pos, sun, atm.cloud_base, atm.cloud_cover),
             morph: self.terrain.morph_ranges(),
+            canopy: canopy_levels,
         };
         queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&fu));
         let passes = [
@@ -883,13 +906,30 @@ impl Renderer {
         let slot = (self.frame_index % self.readbacks.len() as u64) as usize;
         let staged = !self.readbacks[slot].pending && self.readbacks[slot].state.load(Ordering::Acquire) == 0;
         let qs = if staged { self.readbacks[slot].queries.clone() } else { None };
-        let written = match (&qs, self.settings.ssao) {
-            (None, _) => 0,
-            (Some(_), true) => (1 << TIMESTAMPS) - 1,
-            (Some(_), false) => ((1 << TIMESTAMPS) - 1) & !(1 << TS_SSAO),
-        };
+        // A volume refilled from scratch is timed on its own (below); an empty pass may not
+        // take a timestamp on Metal.
+        let canopy_timed = self.canopy.busy() && !self.canopy.filling;
+        let mut written = if qs.is_some() { (1u32 << TIMESTAMPS) - 1 } else { 0 };
+        if !self.settings.ssao {
+            written &= !(1 << TS_SSAO);
+        }
+        if !canopy_timed {
+            written &= !(1 << TS_CANOPY);
+        }
         let pass_end = |i: u32| qs.as_ref().map(|q| RenderPassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(i) });
 
+        if self.canopy.filling {
+            // the first fill (and any refill), on its own so it can be timed
+            let t0 = std::time::Instant::now();
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("canopy fill"), timestamp_writes: None });
+                self.canopy.record(&mut cp, &self.global_bg_shadow);
+            }
+            queue.submit([enc.finish()]);
+            let _ = device.poll(PollType::wait_indefinitely());
+            println!("canopy light volume filled in {:.1} ms", t0.elapsed().as_secs_f32() * 1000.0);
+        }
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let end = (!occlusion).then_some(TS_CULL);
@@ -944,6 +984,12 @@ impl Renderer {
             let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("occlusion cull"), timestamp_writes: tw });
             self.hiz.build(&mut cp);
             self.forest.cull_occluded(&mut cp, &self.global_bg_shadow);
+        }
+        if canopy_timed {
+            let tw = qs.as_ref().map(|q| ComputePassTimestampWrites { query_set: q, beginning_of_pass_write_index: None, end_of_pass_write_index: Some(TS_CANOPY) });
+            let mut cp = enc.begin_compute_pass(&ComputePassDescriptor { label: Some("canopy"), timestamp_writes: tw });
+            // the bind group without the canopy volume, which this writes
+            self.canopy.record(&mut cp, &self.global_bg_shadow);
         }
         // the atmosphere tables; timed together with the clouds
         let sky_params = SkyParams { sun_dir: sun, sun_illum: SUN_ILLUM, haze: atm.haze, cam_alt_m: cam.pos.y, overcast: atm.overcast, ground_albedo: 0.12, fog: fu.fog };
@@ -1136,7 +1182,7 @@ mod tests {
     const ALL: u32 = (1 << TIMESTAMPS) - 1;
     // 1000 ns per tick, so 1000 ticks are a millisecond
     const PERIOD: f32 = 1000.0;
-    const IN_ORDER: [u64; 8] = [10_000, 10_100, 10_300, 10_600, 11_600, 11_700, 11_750, 11_800];
+    const IN_ORDER: [u64; 9] = [10_000, 10_100, 10_150, 10_300, 10_600, 11_600, 11_700, 11_750, 11_800];
 
     fn close(a: Option<f32>, b: f32) -> bool {
         a.is_some_and(|a| (a - b).abs() < 1e-4)
@@ -1195,7 +1241,7 @@ mod tests {
         assert_eq!(t.frame, 7);
         assert!(close(Some(t.total_ms), 1.8));
         assert!(close(t.through_main_ms, 1.6));
-        for (s, want) in t.sections.iter().zip([0.1, 0.2, 0.3, 1.0, 0.1, 0.05, 0.05]) {
+        for (s, want) in t.sections.iter().zip([0.1, 0.05, 0.15, 0.3, 1.0, 0.1, 0.05, 0.05]) {
             assert!(close(*s, want), "{s:?} != {want}");
         }
     }

@@ -57,11 +57,11 @@ fn light(wp: vec3f, n: vec3f, t: f32, tint: vec3f, gloss: f32) -> array<vec3f, 2
     let back = pow(max(dot(-V, L), 0.0), 4.0) * 0.5 * t + max(dot(-n, L), 0.0) * 0.3;
     // down in the sward, the blades shade each other from the sky and the sun
     let ao = mix(0.5, 1.0, smoothstep(0.0, 0.8, t));
-    let vis = sky_vis(wp.xz);
-    let lit = sun * (wrap + back * vec3f(0.95, 1.0, 0.6)) * mix(0.7, 1.0, ao) + ambient_vis(n, wp, vis) * ao;
+    let c = canopy_sample(wp, n);
+    let lit = sun * (wrap + back * vec3f(0.95, 1.0, 0.6)) * mix(0.7, 1.0, ao) + ambient_c(n, wp, c) * ao;
     // glossy: a sun highlight and a sheen of sky at grazing angles (as the ground has it)
     let ndv = saturate(dot(n, V));
-    let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * 0.08 * pow(1.0 - ndv, 3.0);
+    let sheen = SKY.amb_up.rgb * F.sun_color.w * canopy_sky(c, n) * 0.08 * pow(1.0 - ndv, 3.0);
     let spec = (sun * sun_specular(n, V, L, 0.42) + sheen) * gloss * ao;
     // aerial perspective, as apply_fog
     let clip = F.view_proj * vec4f(wp, 1.0);
@@ -70,6 +70,9 @@ fn light(wp: vec3f, n: vec3f, t: f32, tint: vec3f, gloss: f32) -> array<vec3f, 2
     let ap = vec3f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, w);
     let scat = textureSampleLevel(t_ap_scat, s_clamp, ap, 0.0).rgb;
     let trans = textureSampleLevel(t_ap_trans, s_clamp, ap, 0.0).rgb;
+    if (F.debug.y > 1.5) {
+        return array<vec3f, 2>(vec3f(0.0), canopy_debug(vec3f(0.0), c, n));
+    }
     return array<vec3f, 2>(lit * tint * trans, spec * trans + scat);
 }
 

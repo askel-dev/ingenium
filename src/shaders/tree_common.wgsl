@@ -161,40 +161,43 @@ fn perturb(n: vec3f, nm: vec2f, dwx: vec3f, dwy: vec3f, dux: vec2f, duy: vec2f) 
 }
 
 // Light on leaves: ns their own normal, n the crown's rounded one (which carries the shading
-// of the crown as a whole), trans how much light they let through, sh the sun's shadow, vis
-// the share of the sky they see.
-fn shade_leaf(albedo: vec3f, ns: vec3f, n: vec3f, ao: f32, trans: f32, rough: f32, sh: f32, vis: f32, wp: vec3f, V: vec3f) -> vec3f {
+// of the crown as a whole), trans how much light they let through, sh the sun's shadow, c the
+// canopy volume there.
+fn shade_leaf(albedo: vec3f, ns: vec3f, n: vec3f, ao_in: f32, trans: f32, rough: f32, sh: f32, c: Canopy, wp: vec3f, V: vec3f) -> vec3f {
     let L = F.sun_dir.xyz;
     let sun = sun_light(wp);
     let wrap = max((dot(ns, L) + 0.45) / 1.45, 0.0);
     let fwd = pow(max(dot(-V, L), 0.0), 5.0) * 0.3 * mix(0.4, 1.25, trans);
+    // the volume already sees much of what the baked occlusion stands in for
+    let ao = mix(ao_in, 1.0, 0.5 * c.w);
     // the leaves' own normals for the sky too, but half way to the crown's
     let na = normalize(n + ns);
-    var col = albedo * (sun * (wrap * 0.95 + fwd) * sh * mix(0.45, 1.0, ao) + ambient_vis(na, wp, vis) * ao);
+    var col = albedo * (sun * (wrap * 0.95 + fwd) * sh * mix(0.45, 1.0, ao_in) + ambient_c(na, wp, c) * ao);
     // Leaves are waxy: a highlight from the sun off each leaf (GGX, from the scan's roughness)
     // and a sky sheen at grazing angles; uncoloured, as on any dielectric.
     let ndv = saturate(dot(ns, V));
     let fres = 0.04 + 0.16 * pow(1.0 - ndv, 4.0);
-    let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * fres * 0.35;
-    col += sun * sun_specular(ns, V, L, max(rough, 0.3)) * sh * mix(0.45, 1.0, ao) * 0.8 + sheen * ao;
+    let sheen = SKY.amb_up.rgb * F.sun_color.w * canopy_sky(c, na) * fres * 0.35;
+    col += sun * sun_specular(ns, V, L, max(rough, 0.3)) * sh * mix(0.45, 1.0, ao_in) * 0.8 + sheen * ao;
     // Leaves are thin: light falling on one side comes out of the other, deeper and yellower
     // than the leaf's own colour, less through veins and twigs. The crown's normals point
     // outwards, so the leaves under a crown glow with the sun and sky on their upper side, as a
     // canopy does seen from below.
     let tcol = albedo * vec3f(1.1, 1.15, 0.6) * mix(0.3, 1.4, trans);
-    let through = sun * max(dot(-ns, L), 0.0) * sh * 0.7 + ambient_vis(-n, wp, vis) * ao * 0.65;
+    let through = sun * max(dot(-ns, L), 0.0) * sh * 0.7 + ambient_c(-n, wp, c) * ao * 0.65;
     col += tcol * through;
     return col;
 }
 
 // Light on bark: ns the normal-mapped normal, tex_ao the scan's occlusion.
-fn shade_bark(albedo: vec3f, ns: vec3f, ao: f32, tex_ao: f32, rough: f32, sh: f32, vis: f32, wp: vec3f, V: vec3f) -> vec3f {
+fn shade_bark(albedo: vec3f, ns: vec3f, ao_in: f32, tex_ao: f32, rough: f32, sh: f32, c: Canopy, wp: vec3f, V: vec3f) -> vec3f {
     let L = F.sun_dir.xyz;
     let sun = sun_light(wp);
     let nl = max(dot(ns, L), 0.0);
+    let ao = mix(ao_in, 1.0, 0.6 * c.w);
     // the crevices of the bark shade themselves, and hold less of the sky
     let direct = sun * sh * micro_shadow(tex_ao, nl);
-    var col = albedo * (direct * nl + ambient_vis(ns, wp, vis) * ao * tex_ao);
+    var col = albedo * (direct * nl + ambient_c(ns, wp, c) * ao * tex_ao);
     col += direct * sun_specular(ns, V, L, rough);
     return col;
 }

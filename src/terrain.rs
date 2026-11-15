@@ -410,6 +410,11 @@ impl Terrain {
         }
     }
 
+    /// The highest point of the heightmap.
+    pub fn max_height(&self) -> f32 {
+        self.heights.iter().copied().fold(f32::MIN, f32::max)
+    }
+
     /// Smooth surface normal from the heightmap alone, for walkable-slope tests.
     pub fn normal_at(&self, x: f32, z: f32) -> Vec3 {
         let e = 2.0;

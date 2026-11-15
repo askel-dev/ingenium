@@ -1,5 +1,6 @@
-// One-time bake after the heightmap: the terrain normal (xyz) and how much of the sky each
-// point sees (w), for the ambient light. For each of 16 directions it marches outwards over
+// One-time bake after the heightmap: the terrain normal (x and z; globals.wgsl rebuilds y, which
+// is always up) and how much of the sky each point sees, for the ambient light: z with the
+// terrain alone, w with the forest too. For each of 16 directions it marches outwards over
 // ~2 km of heightmap, finds the highest horizon above the local tangent plane, and counts
 // the cosine-weighted share of the sky below it as blocked. Valleys, gullies and the foot
 // of a slope come out darker; ridges and open plains see the whole sky.
@@ -99,5 +100,5 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     occ_ground /= f32(DIRS);
     occ_canopy /= f32(DIRS);
     let vis = 1.0 - mix(occ_ground, occ_canopy, CANOPY_BLOCK);
-    textureStore(o_normal, ip, vec4f(n, vis));
+    textureStore(o_normal, ip, vec4f(n.x, n.z, 1.0 - occ_ground, vis));
 }

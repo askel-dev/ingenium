@@ -1231,6 +1231,55 @@ pub struct Composed {
     pub secs: f32,
 }
 
+/// Blocks per side of a layer in `LeafCover`.
+const COVER_GRID: usize = 64;
+
+/// How much of each block of every atlas layer is leaf (alpha-tested at a half), for the
+/// canopy light volume's leaf density.
+pub struct LeafCover(Vec<Vec<f32>>);
+
+impl LeafCover {
+    /// The share of `layer` that is leaf between the uv corners `lo` and `hi`.
+    pub fn over(&self, layer: usize, lo: Vec2, hi: Vec2) -> f32 {
+        let Some(g) = self.0.get(layer) else { return 0.45 };
+        let n = COVER_GRID as f32;
+        let (x0, y0) = ((lo.x * n).floor().clamp(0.0, n - 1.0) as usize, (lo.y * n).floor().clamp(0.0, n - 1.0) as usize);
+        let (x1, y1) = (((hi.x * n).ceil() as usize).clamp(x0 + 1, COVER_GRID), ((hi.y * n).ceil() as usize).clamp(y0 + 1, COVER_GRID));
+        let mut s = 0.0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                s += g[y * COVER_GRID + x];
+            }
+        }
+        s / ((x1 - x0) * (y1 - y0)) as f32
+    }
+}
+
+impl Composed {
+    pub fn leaf_cover(&self) -> LeafCover {
+        let size = SIZE as usize;
+        let b = size / COVER_GRID;
+        LeafCover(
+            self.levels
+                .iter()
+                .map(|chain| {
+                    let a = &chain[0].0;
+                    let mut g = vec![0.0; COVER_GRID * COVER_GRID];
+                    for y in 0..size {
+                        for x in 0..size {
+                            if a[(y * size + x) * 4 + 3] >= 128 {
+                                g[(y / b) * COVER_GRID + x / b] += 1.0;
+                            }
+                        }
+                    }
+                    g.iter_mut().for_each(|c| *c /= (b * b) as f32);
+                    g
+                })
+                .collect(),
+        )
+    }
+}
+
 /// Decode the scans and compose the atlases (CPU only, so it can run beside other startup work).
 pub fn compose_all() -> Composed {
     let t0 = Instant::now();

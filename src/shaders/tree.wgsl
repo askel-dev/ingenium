@@ -105,10 +105,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // tree: the shadow is looked up a little towards the sun, out of the tree's own.
     let dist = distance(in.wp, F.cam_pos.xyz);
     let lift = select(0.0, 2.5, kind == 1u || kind == 2u) * smoothstep(F.cascade.x * 0.75, F.cascade.x, dist);
-    var sh = shadow_at(in.wp + L * lift, n);
-    // the baked sky visibility is for the ground: up in the crown much more of the sky is open
+    // the canopy volume, out along the leaves' crown normal or the bark's own
+    var c = canopy_sample(in.wp, n);
+    // beyond it the bake is for the ground: up in the crown much more of the sky is open
     let up = saturate(in.misc.z / 12.0);
-    let vis = mix(sky_vis(in.wp.xz), 1.0, select(up * 0.85, 0.75, kind == 2u));
+    c.vis_fb = mix(c.vis_fb, 1.0, select(up * 0.85, 0.75, kind == 2u));
+    var sh = shadow_at(in.wp + L * lift, n, canopy_sun(c));
 
     var col: vec3f;
     var alpha = 1.0;
@@ -118,7 +120,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
         // cluster), in the card's frame, around the rounded crown normal: every leaf of a card
         // catches the light on its own.
         let ns = perturb(n, texn.xy * 2.0 - 1.0, dwx, dwy, dux, duy);
-        col = shade_leaf(tex.rgb * tint, ns, n, ao, texn.w, texn.z, sh, vis, in.wp, V);
+        col = shade_leaf(tex.rgb * tint, ns, n, ao, texn.w, texn.z, sh, c, in.wp, V);
     } else if (kind == 0u || kind == 3u) {
         let m = mat_fetch(i32(min(species, 2u)), in.bark.xy, dbx, dby);
         var albedo = m.a.rgb;
@@ -140,7 +142,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
             ns = normalize(mix(ns, n, moss * 0.6));
             tex_ao = mix(tex_ao, 1.0, moss * 0.5);
         }
-        col = shade_bark(albedo, ns, ao, tex_ao, rough, sh, vis, in.wp, V);
+        col = shade_bark(albedo, ns, ao, tex_ao, rough, sh, c, in.wp, V);
     } else if (kind == 4u) {
         // rock: the rock scan projected along the three axes by world position
         let tile = 0.45;
@@ -159,7 +161,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
         albedo = mix(albedo, MOSS, moss);
         rough = mix(rough, 0.95, moss);
         ns = normalize(mix(ns, n, moss * 0.5));
-        col = shade_bark(albedo, ns, ao, tex_ao, rough, sh, vis, in.wp, V);
+        col = shade_bark(albedo, ns, ao, tex_ao, rough, sh, c, in.wp, V);
     } else if (kind == 5u) {
         // cut or broken wood: growth rings, weathered grey, the bark's dark rim
         let rr = length(in.uv);
@@ -167,7 +169,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
         var albedo = mix(vec3f(0.30, 0.21, 0.12), vec3f(0.21, 0.145, 0.08), rings * 0.6);
         albedo = mix(albedo, vec3f(0.16, 0.15, 0.13), 0.4 + 0.3 * gnoise(in.uv * 5.0));
         albedo = mix(albedo, vec3f(0.07, 0.055, 0.04), smoothstep(0.86, 0.98, rr));
-        col = shade_bark(albedo, n, ao, 1.0, 0.85, sh, vis, in.wp, V);
+        col = shade_bark(albedo, n, ao, 1.0, 0.85, sh, c, in.wp, V);
     } else {
         // The inner hull (spruce LOD1) has no leaves of its own: the leaves' average colour,
         // lit like them, and a soft highlight where it faces between sun and eye, as the
@@ -176,12 +178,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let nz = gnoise(q.xz + q.y * 0.7) * 0.5 + gnoise(q.xz * 2.3 - q.y) * 0.3;
         let albedo = canopy_color(species) * tint * (0.95 + 0.45 * nz);
         sh = mix(sh, 1.0, 0.4);
-        col = shade_leaf(albedo, n, n, ao, 0.6, 0.6, sh, vis, in.wp, V);
+        col = shade_leaf(albedo, n, n, ao, 0.6, 0.6, sh, c, in.wp, V);
     }
     if (F.debug.x > 0.5) {
         col = mix(col, lod_tint(in.info.w) * 0.3, 0.6);
     }
-    col = apply_fog(col, in.wp);
+    col = canopy_debug(apply_fog(col, in.wp), c, n);
     return vec4f(col, alpha);
 }
 
@@ -378,21 +380,24 @@ fn fs_imp(in: VImp) -> @location(0) vec4f {
     let nc = normalize(right * q.x + up * q.y + fwd * sqrt(max(1.0 - dot(q, q), 0.1)));
     let n = normalize(ns + nc * 0.6);
     let L = F.sun_dir.xyz;
-    // the baked sky visibility is for the ground: up in the crown much more of the sky is open
+    // The canopy volume on the crown's surface towards the camera, not on the quad through the
+    // tree's middle: a sphere of the quad's half size bulging out of it.
+    let q0 = in.uv2q.zw;
+    var c = canopy_sample(in.wp + fwd * in.w.w * sqrt(max(1.0 - dot(q0, q0), 0.0)), nc);
     let up_frac = saturate(in.misc.x / 12.0);
-    let vis = mix(sky_vis(in.wp.xz), 1.0, up_frac * 0.85);
+    c.vis_fb = mix(c.vis_fb, 1.0, up_frac * 0.85);
     // out of the tree's own shadow (its impostor faces the sun through its middle)
-    var sh = shadow_at(in.wp + L * in.w.w, n);
+    var sh = shadow_at(in.wp + L * in.w.w, n, canopy_sun(c));
     sh = mix(sh, 1.0, 0.3);
     let tint = tree_tint(in.info.y, in.misc.y);
     let ao = s.ao;
-    let leaf = shade_leaf(s.albedo * tint, ns, n, ao, 0.65, 0.5, sh, vis, in.wp, V);
-    let bark = shade_bark(s.albedo, ns, ao, 1.0, 0.8, sh, vis, in.wp, V);
+    let leaf = shade_leaf(s.albedo * tint, ns, n, ao, 0.65, 0.5, sh, c, in.wp, V);
+    let bark = shade_bark(s.albedo, ns, ao, 1.0, 0.8, sh, c, in.wp, V);
     var col = mix(bark, leaf, saturate(s.leaf));
     if (F.debug.x > 0.5) {
         col = mix(col, lod_tint(2u) * 0.3, 0.6);
     }
-    col = apply_fog(col, in.wp);
+    col = canopy_debug(apply_fog(col, in.wp), c, nc);
     return vec4f(col, alpha);
 }
 

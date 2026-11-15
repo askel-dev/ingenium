@@ -140,7 +140,7 @@ fn fs_ao(in: VOut) -> @location(0) vec4f {
     let sh = textureSampleCompareLevel(t_shadow, s_shadow, suv, 1, lp.z);
     let cs = cloud_shadow(wp);
     let direct = dot(SKY.sun.rgb, lum) * cs.x * ndl * sh;
-    let vis = sky_vis(wp.xz);
+    let vis = canopy_sky(canopy_sample(wp, n), n);
     let amb = dot(SKY.amb_up.rgb, lum) * F.sun_color.w * vis + dot(SKY.sun.rgb, lum) * max(L.y, 0.0) * cs.y * vis;
     let amb_frac = amb / max(amb + direct, 1e-5);
 

@@ -36,6 +36,7 @@ takes a minute or two.
 | hold `[` / `]` | move the sun down / up through the day |
 | `F` | **freeze culling**, then fly away to see exactly what the GPU decided to draw |
 | `L` | colour trees by LOD (red → yellow → green = full mesh → lighter mesh → impostor) |
+| `K` | canopy light volume: on → off → show the sky each surface sees → show the sun the leaves let through |
 | `G` | toggle grass and undergrowth |
 | `O` | toggle screen-space ambient occlusion |
 | `H` | toggle the stats overlay |
@@ -50,12 +51,13 @@ and triangles per frame.
 Command-line options: `--novsync` (benchmark), `--msaa 1|4`, `--scale 0.5` (render the scene at that fraction of
 the output size and upscale it; a window defaults to one scene pixel per point, so half size on Retina, a capture to
 full size), `--no-prepass` (shade trees without the depth prepass, to compare), `--no-grass`, `--no-occlusion` (draw the distant trees without
-testing them against the near ones, to compare), `--lod 60,180` (where trees switch to the lighter mesh and to
+testing them against the near ones, to compare), `--no-canopy` (light the forest from the 2D sky visibility map alone, to
+compare), `--canopy-view 2|3` (a capture of `K`'s views), `--lod 60,180` (where trees switch to the lighter mesh and to
 impostors, in metres for an average-sized tree: the quality/speed trade-off), `--atmos 0-3`, `--sun-shift <degrees>`, `--size 1920x1080`,
 and headless screenshots with `--capture out.png [--time 60] [--cam x,y,z,yaw,pitch] [--lod-tint] [--no-ao] [--hud] [--frames 30]`
 (a negative camera height in `--cam` means that many metres above the ground). A capture renders
 `--frames` frames of the same view and prints the median GPU time over the second half of them:
-the whole frame, the span through the main pass, each pass (cull, grass and occluders, sky + clouds,
+the whole frame, the span through the main pass, each pass (cull, grass and occluders, canopy, sky + clouds,
 shadows, main, SSAO, bloom, post) and how many terrain patches each view drew.
 
 ## How it works
@@ -86,7 +88,26 @@ Every frame:
    branches (both lying along the ground's slope), stumps flared into their roots, rocks and
    slabs, in the bark and rock scans. The forest-floor plants and the clutter are written in the trees'
    record layout, so the tree pipeline draws them: one indirect draw per kind.
-3. **Clouds** (`shaders/clouds.wgsl`): a cloud layer 1.2–4.4 km up, wrapped around a curved
+3. **Canopy light volume** (`src/canopy.rs`, `shaders/canopy.wgsl`): a clipmap of four levels
+   of 128 × 128 voxels (1, 2, 4 and 8 m across, at most 2 m tall, from 4 m under the ground to
+   44 m over it, following the terrain) around the camera, holding the trees' leaves and bark as
+   extinction. Nothing is voxelised from meshes: each kind's LOD0 is baked once into a 32³
+   density box (leaves block half their area, less what the cards' cut-outs let through,
+   measured from the foliage atlas; bark a quarter of its surface), and a voxel gathers the
+   trees whose scatter cells are around it. From the density, a **sun** pass marches each voxel
+   towards the sun through ever coarser levels (0 under a hill), and a **light** pass traces 16
+   cones over its sky, storing what the leaves let through as SH-L1, and how sunlit and
+   sky-lit the leaves that block it are. Every surface's ambient light then comes from real 3D
+   occlusion: the sky the terrain hides (the 2D bake) sends back ground light, the sky the
+   leaves hide sends back what they pass on of the sun and sky on them, so a crown is dark
+   inside with a bright rim, and the floor under a stand is as dark as the canopy above it.
+   Beyond the shadow cascades (260 m) it also gives the trees' and hills' shadows, out to
+   ~500 m; past the volume the 2D bake takes over. The levels wrap around in x and z, so when
+   the camera moves only the slabs it uncovers are rebuilt (about 0.2 ms at 30 m/s), and
+   nothing else changes but the sun: after `[` / `]` the volume refreshes in strips over half a
+   second (~1.4 ms a frame). Filling it from scratch takes 40–80 ms, at startup and on a change
+   of preset. The shading adds ~0.3 ms.
+4. **Clouds** (`shaders/clouds.wgsl`): a cloud layer 1.2–4.4 km up, wrapped around a curved
    planet, is raymarched through tiling Perlin-Worley and Worley noise volumes and a weather map
    (coverage, cloud type), all baked on the GPU at startup. Light comes from a short march towards
    the sun, a cheap multiple-scattering approximation and occluded skylight. The buffer is
@@ -104,7 +125,7 @@ Every frame:
    colour, the ambient light, the haze on distant ridges and the light on the clouds all come
    from it, so a ridge fades into exactly the sky behind it and a preset is mostly a sun angle
    and a haze level.
-4. **Shadows**: two cascades. The near one renders full leaf cards with alpha test, which
+5. **Shadows**: two cascades. The near one renders full leaf cards with alpha test, which
    gives the dappled light under the canopy, and the clutter. The far one renders every tree
    as its impostor, turned to face the sun and cut out by the frames baked nearest the sun's
    direction, so a tree's shadow keeps its outline at a fraction of the cost.
@@ -113,7 +134,7 @@ Every frame:
    swept towards the sun, plus a plane past its far side. The box itself is a square around a
    sphere, so most trees in it would cast their shadows off screen or behind the camera; over
    the forest this leaves out about 80% of the trees in the near cascade and 70% in the far one.
-5. **Main pass** (HDR, 4× MSAA with alpha-to-coverage for leaves): CDLOD terrain, the far
+6. **Main pass** (HDR, 4× MSAA with alpha-to-coverage for leaves): CDLOD terrain, the far
    canopy shell, 25 indirect draws for all trees, grass, then the sky with the clouds
    composited over it.
    Beyond ~180 m a tree is an **impostor** (`src/impostor.rs`): at startup each variant's full
@@ -123,9 +144,9 @@ Every frame:
    the camera that blends the three frames nearest the direction it is seen from, each
    reprojected along the view ray, and is lit like the mesh with the same per-tree colour, so
    the switch is hard to spot. The mips keep each frame's alpha-tested coverage, so a distant
-   crown doesn't thin out. All 12 variants bake in about 0.15 s. Where trees block the sky, the forest floor gets green **light
-   through the canopy** instead (a share of the sun and sky falling on the leaves above), and
-   leaves let light through from their other side, so a canopy glows seen from below.
+   crown doesn't thin out. All 12 variants bake in about 0.15 s. Where trees block the sky, a surface gets green **light
+   through the canopy** instead (from the canopy volume, above), and leaves let light through
+   from their other side, so a canopy glows seen from below.
    Leaves, fronds, conifer sprays, grass and flowers are **scanned foliage** (`src/foliage.rs`,
    CC0 plant atlases from Poly Haven in `assets/foliage/`): single scanned leaves are cut out of
    them and composed at startup into twigs of dozens of leaves, each turned, foreshortened and
@@ -148,18 +169,19 @@ Every frame:
    part of a tile.
    Ambient light everywhere is scaled by a **sky visibility** map baked
    once at startup (`shaders/sky_vis.wgsl`): from every heightmap texel, 16 directions are
-   marched ~2 km out to find the horizon, with the forest counted as an 18 m canopy that blocks
-   part of the sky. Valleys, the foot of slopes, clearings and the forest floor get less sky
-   light and more light bounced off the surrounding ground.
-6. **SSAO** (`shaders/ssao.wgsl`, half resolution, ~0.4 ms at 1080p): contact shadows where
+   marched ~2 km out to find the horizon, once over the bare terrain and once with the forest
+   counted as an 18 m canopy that blocks part of the sky. Valleys, the foot of slopes and
+   clearings get less sky light and more light bounced off the surrounding ground; the canopy
+   volume uses the bare-terrain one, and the other stands in for it beyond the volume.
+7. **SSAO** (`shaders/ssao.wgsl`, half resolution, ~0.4 ms at 1080p): contact shadows where
    trunks meet the ground, between grass blades and under low branches. Lighting is forward,
    so there is no separate ambient term to darken. Instead the pass reconstructs each pixel's
    position and normal from depth, re-evaluates the sun and cloud shadow there, and occludes
    only the share of the light that was ambient. Sunlit ground next to a trunk keeps its
    sunlight.
-7. **Bloom** (`shaders/bloom.wgsl`): a 6-level mip chain filtered down and added back up, so
+8. **Bloom** (`shaders/bloom.wgsl`): a 6-level mip chain filtered down and added back up, so
    the sun disk (drawn at its real 0.53°) and the bright cloud edges glow.
-8. **Auto exposure and tonemap** (`shaders/exposure.wgsl`, ACES): the log-average brightness
+9. **Auto exposure and tonemap** (`shaders/exposure.wgsl`, ACES): the log-average brightness
    of a 48 × 48 grid of the frame, eased over about half a second, opens the exposure by up
    to ~1.6 stops when the view is darker than open ground, the way a camera does under trees.
 
@@ -185,6 +207,7 @@ Pieces worth reading:
 | `src/forest.rs`, `shaders/scatter.wgsl` | GPU scatter of the trees (density map with gaps where an old tree fell → compact list), each given a variant from the forest around it: open-grown trees in the open and at edges, young ones at edges and in gaps, and a mantle of young trees just outside the forest that thickens its edge down to the ground; cull buffers, indirect draws |
 | `src/renderer.rs` | frame orchestration, cascaded shadows, atmosphere presets, GPU timestamps |
 | `src/hiz.rs`, `shaders/cull.wgsl` (`occluded`) | the depth pyramid, and the test of a tree's projected bounding sphere against it |
+| `src/canopy.rs`, `shaders/canopy.wgsl`, `globals.wgsl` (`canopy_sample`, `ambient_c`) | the canopy light volume: the per-kind density bake, the clipmap's scrolling (a scrolled-in column gets its light once it is 3 voxels inside, where its cones find the level on every side), the density, sun and cone-traced sky passes, and the shading that reads them |
 | `src/player.rs` | first-person controller: stands on exactly the ground that is drawn (a CPU copy of the terrain's detail noise), can't climb slopes over ~45° and slides off them, and walks around trunks. The tree list is read back from the GPU once into a one-tree-per-cell grid, the only place the CPU looks at individual trees |
 
 ## Where to take it next
@@ -203,4 +226,7 @@ Pieces worth reading:
   to the colour of the grass behind it, while its white trunk and limbs stay solid, so it can
   read as a dead tree. Lighter, yellower birch foliage and denser crowns at a distance would
   fix it.
-- **GI**: screen-space GI plus a coarse voxel scene for off-screen bounce light.
+- **More from the canopy volume**: light bounced off the forest floor scaled by the sun that
+  reaches it (the sun pass at ground level), a canopy colour per species, and the undergrowth
+  in the density.
+- **GI**: screen-space GI for the small, near detail the canopy volume is too coarse for.

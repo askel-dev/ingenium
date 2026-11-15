@@ -1,10 +1,11 @@
 //! ingenium: a small GPU-driven forest renderer.
 //!
 //!   cargo run --release                       window, cinematic flythrough
-//!   cargo run --release -- --capture out.png  headless screenshot (+ --time, --size, --atmos, --cam, --no-ao)
+//!   cargo run --release -- --capture out.png  headless screenshot (+ --time, --size, --atmos, --cam, --no-ao, --no-canopy)
 
 mod bloom;
 mod camera;
+mod canopy;
 mod clouds;
 mod exposure;
 mod foliage;
@@ -71,6 +72,8 @@ struct Args {
     occlusion: bool,
     lod: [f32; 2],
     leaf_png: Option<String>,
+    /// the canopy light volume's mode (renderer::Settings::canopy)
+    canopy: u32,
 }
 
 fn parse_args() -> Args {
@@ -94,6 +97,7 @@ fn parse_args() -> Args {
         occlusion: true,
         lod: forest::LOD_DIST,
         leaf_png: None,
+        canopy: 0,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -128,6 +132,8 @@ fn parse_args() -> Args {
             "--hud" => a.hud = true,
             "--no-prepass" => a.prepass = false,
             "--no-occlusion" => a.occlusion = false,
+            "--no-canopy" => a.canopy = 1,
+            "--canopy-view" => { a.canopy = next(i).parse().unwrap_or(a.canopy); i += 1; }
             "--scale" => { a.scale = next(i).parse().ok(); i += 1; }
             "--leaf-png" => { a.leaf_png = Some(next(i)); i += 1; }
             "--lod" => {
@@ -159,7 +165,7 @@ fn main() {
         "controls: Tab cinematic/player · click to grab mouse, Esc to release · V walk/fly\n\
          \x20 walk:    WASD move, Space jump, Shift sprint, Ctrl/C crouch\n\
          \x20 fly:     WASD move, Space/E up, Q/C down, Shift fast, Ctrl slow\n\
-         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · G grass · H stats overlay · -/= render scale · F11 fullscreen · P print camera"
+         \x20 render:  1-4 time of day · [ ] move the sun · F freeze culling · L LOD colours · K canopy light · G grass · H stats overlay · -/= render scale · F11 fullscreen · P print camera"
     );
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App { args, state: None };
@@ -179,6 +185,7 @@ fn capture(args: &Args) {
     r.settings.prepass = args.prepass;
     r.settings.occlusion = args.occlusion;
     r.settings.lod = args.lod;
+    r.settings.canopy = args.canopy;
     if let Some(s) = args.scale {
         r.set_scale(&gpu.device, s);
     }
@@ -378,6 +385,7 @@ impl App {
         renderer.settings.prepass = self.args.prepass;
         renderer.settings.occlusion = self.args.occlusion;
         renderer.settings.lod = self.args.lod;
+        renderer.settings.canopy = self.args.canopy;
         renderer.set_scale(&gpu.device, self.args.scale.unwrap_or(1.0 / window.scale_factor() as f32));
         let hud = hud::Hud::new(&gpu.device, format);
         let path = FlyPath::new(&renderer.terrain);
@@ -500,6 +508,10 @@ impl State {
                 println!("culling {}", if s.freeze { "FROZEN: fly away to see what the GPU kept" } else { "live" });
             }
             KeyCode::KeyL => s.lod_tint = !s.lod_tint,
+            KeyCode::KeyK => {
+                s.canopy = (s.canopy + 1) % 4;
+                println!("canopy light {}", ["on", "off", "on: showing the share of the sky each surface sees", "on: showing the sun the leaves let through"][s.canopy as usize]);
+            }
             KeyCode::F11 => {
                 let full = self.window.fullscreen().is_some();
                 self.window.set_fullscreen(if full { None } else { Some(winit::window::Fullscreen::Borderless(None)) });

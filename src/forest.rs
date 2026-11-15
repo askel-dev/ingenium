@@ -6,6 +6,8 @@
 //! bucket with its own indirect draw; the impostors are all the same quad, so every kind
 //! shares one bucket and the shader picks the kind's atlas layer: 25 draws per view.
 
+use crate::canopy::{self, KindDensity};
+use crate::foliage::LeafCover;
 use crate::impostor::{self, BakeKind, Impostors};
 use crate::treegen::{self, TreeVertex, MESH_LODS, SPECIES, VARIANTS};
 use crate::util::*;
@@ -103,8 +105,11 @@ pub struct Forest {
     pipes: [RenderPipeline; 4],
     imp_pipes: [RenderPipeline; 4],
     bounds: [Vec4; KINDS],
-    trees_buf: Buffer,
+    /// the tree records (scatter.wgsl)
+    pub trees_buf: Buffer,
     impostors: Impostors,
+    /// each kind's leaves and bark as extinction, for the canopy light volume
+    pub density: KindDensity,
 }
 
 pub struct ViewSetup {
@@ -128,6 +133,7 @@ impl Forest {
         hdr: TextureFormat,
         msaa: u32,
         world: f32,
+        leaf_cover: &LeafCover,
     ) -> Forest {
         // ---- meshes
         let kinds = treegen::build_all();
@@ -168,6 +174,7 @@ impl Forest {
         let vbuf = buffer_init(device, "tree verts", cast_slice(&verts), BufferUsages::VERTEX);
         let ibuf = buffer_init(device, "tree idx", cast_slice(&idx), BufferUsages::INDEX);
         let impostors = impostor::bake(device, queue, global_bgl, global_bg, &vbuf, &ibuf, &bake);
+        let density = canopy::bake_kinds(device, queue, &kinds, leaf_cover);
 
         // ---- scatter
         let dim = (world / SCATTER_CELL) as u32;
@@ -366,6 +373,7 @@ impl Forest {
             bounds,
             trees_buf,
             impostors,
+            density,
         }
     }
 

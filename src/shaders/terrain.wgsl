@@ -119,7 +119,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let ax = length(dpx);
     let ay = length(dpy);
     let fp = max(mix(sqrt(ax * ay), max(ax, ay), 0.25), 1e-4);
-    // the share of the sky the ground sees, terrain and forest
+    // the share of the sky the ground sees, terrain and forest, for the meadow's colour
     let vis = sky_vis(p);
 
     // macro normal from the baked map + procedural micro detail up close; beyond 140 m the
@@ -217,9 +217,11 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
     let L = F.sun_dir.xyz;
     let ndl = max(dot(n, L), 0.0);
-    let sh = shadow_at(in.wp, nm);
-    // far away there is no shadow map: darken dense forest floor instead
-    let canopy = mix(1.0, 0.35, smoothstep(0.45, 0.85, forest) * smoothstep(F.cascade.y * 0.6, F.cascade.y, dist));
+    let c = canopy_sample(in.wp, nm);
+    let sh = shadow_at(in.wp, nm, canopy_sun(c));
+    // beyond the shadow map the canopy volume lets the sun through the leaves; beyond that,
+    // dense forest floor is darkened instead
+    let canopy = mix(1.0, 0.35, smoothstep(0.45, 0.85, forest) * (1.0 - c.w) * smoothstep(F.cascade.y * 0.6, F.cascade.y, dist));
 
     // A grass sward is not a flat surface: looking down into it you see the dark gaps
     // between blades, at a grazing angle only lit blade sides; with the sun behind you
@@ -232,13 +234,13 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let sward_look = mix(1.0, grazing, grassy);
     let sun = sun_light(in.wp) * sh * canopy * micro_shadow(tex_ao, ndl);
     let direct = sun * (ndl * (1.0 + hot * grassy) + back * grassy);
-    let amb = ambient_vis(n, in.wp, vis) * tex_ao;
+    let amb = ambient_c(n, in.wp, c) * tex_ao;
     // blades are a little glossy: at a grazing angle the sward picks up a sheen of sky
-    let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * 0.05 * pow(1.0 - ndv, 4.0) * grassy;
+    let sheen = SKY.amb_up.rgb * F.sun_color.w * canopy_sky(c, n) * 0.05 * pow(1.0 - ndv, 4.0) * grassy;
     var col = albedo * sward_look * (direct + amb) + sheen;
     // wet leaves and bare rock catch the sun (the sward's own gloss is the sheen above)
     col += sun * sun_specular(n, V, L, rough) * (1.0 - grassy);
-    col = apply_fog(col, in.wp);
+    col = canopy_debug(apply_fog(col, in.wp), c, n);
     return vec4f(col, 1.0);
 }
 
@@ -315,5 +317,11 @@ fn fs_canopy(in: CanopyOut) -> @location(0) vec4f {
     let vis = mix(sky_vis(p), 1.0, 0.75);
     var col = albedo * (sun_light(in.wp) * wrap * mix(0.45, 1.0, gap) + ambient_vis(n, in.wp, vis) * mix(0.5, 1.0, gap));
     col = apply_fog(col, in.wp);
+    if (F.debug.y > 1.5) {
+        // the `K` views (beyond the canopy volume: the 2D bake's guess)
+        var c = canopy_sample(in.wp, n);
+        c.vis_fb = mix(c.vis_fb, 1.0, 0.75);
+        col = canopy_debug(col, c, n);
+    }
     return vec4f(col, alpha);
 }
