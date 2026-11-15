@@ -315,10 +315,11 @@ impl Trunks {
             if c.x < 0 || c.y < 0 || c.x >= dim || c.y >= dim {
                 continue;
             }
-            // bits 0-1 species, 10-17 scale (decoded as in tree.wgsl)
+            // bits 0-1 species, 10-17 scale, 18-19 variant (decoded as in tree_common.wgsl)
             let species = (t[3] & 3).min(2) as usize;
+            let variant = ((t[3] >> 18) & 3) as usize;
             let scale = 0.75 + ((t[3] >> 10) & 255) as f32 / 255.0 * 0.55;
-            let r = ((TRUNK_R[species] * scale / RADIUS_UNIT).round() as u32).clamp(1, 255);
+            let r = ((TRUNK_R[species][variant] * scale / RADIUS_UNIT).round() as u32).clamp(1, 255);
             let f = p - c.as_vec2();
             cells[(c.y * dim + c.x) as usize] = quant(f.x) | quant(f.y) << 12 | r << 24;
         }

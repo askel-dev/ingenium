@@ -3,13 +3,17 @@
 //! records have the same layout as the trees', so they are drawn with the tree pipeline: one
 //! indirect draw per kind.
 
+use crate::forest::Forest;
 use crate::treegen::{self, TreeVertex};
 use crate::util::*;
 use bytemuck::{cast_slice, Pod, Zeroable};
 use glam::{Vec3, Vec4};
 use wgpu::*;
 
-pub const KINDS: usize = 3;
+/// fern, shrub, ground cover; and the clutter: log, fallen branch, stump, rock, slab
+pub const KINDS: usize = 8;
+/// the first of the clutter, which casts shadows
+const CLUTTER: usize = 3;
 /// Plants per kind at most.
 const CAP: u32 = 12_000;
 /// Grid cell (one plant at most per cell) and how far out plants grow.
@@ -22,7 +26,7 @@ struct Params {
     planes: [Vec4; 6],
     origin: Vec4,        // x, z of the grid's first cell, cell size, radius
     dims: [u32; 4],      // cells per side, capacity per kind
-    kinds: [Vec4; KINDS], // x = texture layer, y = bounding radius
+    kinds: [Vec4; KINDS], // x = species bits, y = bounding radius
 }
 
 pub struct Undergrowth {
@@ -40,7 +44,7 @@ pub struct Undergrowth {
 }
 
 impl Undergrowth {
-    pub fn new(device: &Device, global_bgl: &BindGroupLayout, tree_bgl: &BindGroupLayout) -> Undergrowth {
+    pub fn new(device: &Device, global_bgl: &BindGroupLayout, forest: &Forest) -> Undergrowth {
         let plants = treegen::build_plants();
         let mut verts: Vec<TreeVertex> = Vec::new();
         let mut idx: Vec<u32> = Vec::new();
@@ -75,7 +79,7 @@ impl Undergrowth {
         let gen_bg = bind_group(device, "plant gen", &gen_bgl, &[params_buf.as_entire_binding(), records.as_entire_binding(), args_buf.as_entire_binding()]);
         let module = shader(device, "plant gen", &[NOISE_WGSL, GLOBALS_WGSL, include_str!("shaders/undergrowth.wgsl")]);
         let gen_pipe = compute_pipeline(device, "plant gen", &pipeline_layout(device, &[global_bgl, &gen_bgl]), &module, "main");
-        let draw_bg = bind_group(device, "plants", tree_bgl, &[records.as_entire_binding()]);
+        let draw_bg = forest.records_bind_group(device, &records);
         let dim = (RADIUS * 2.0 / CELL).ceil() as u32 + 2;
         Undergrowth { params_buf, args_buf, reset_args, kinds, vbuf, ibuf, ids, gen_bg, draw_bg, gen_pipe, dim }
     }
@@ -97,11 +101,20 @@ impl Undergrowth {
 
     /// Draws with the tree colour pipeline (`Forest::color_pipeline`); group 2 must be set.
     pub fn draw(&self, pass: &mut RenderPass<'_>, pipe: &RenderPipeline) {
+        self.draw_kinds(pass, pipe, 0..KINDS);
+    }
+
+    /// The clutter into a shadow map, with the tree shadow pipeline (`Forest::shadow_pipeline`).
+    pub fn draw_shadow(&self, pass: &mut RenderPass<'_>, pipe: &RenderPipeline) {
+        self.draw_kinds(pass, pipe, CLUTTER..KINDS);
+    }
+
+    fn draw_kinds(&self, pass: &mut RenderPass<'_>, pipe: &RenderPipeline, kinds: std::ops::Range<usize>) {
         pass.set_pipeline(pipe);
         pass.set_bind_group(1, &self.draw_bg, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.set_index_buffer(self.ibuf.slice(..), IndexFormat::Uint32);
-        for k in 0..KINDS {
+        for k in kinds {
             pass.set_vertex_buffer(1, self.ids.slice(k as u64 * CAP as u64 * 4..));
             pass.draw_indexed_indirect(&self.args_buf, (k * 20) as u64);
         }

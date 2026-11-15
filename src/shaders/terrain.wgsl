@@ -37,9 +37,11 @@ fn vs(@builtin(vertex_index) vid: u32, @location(0) quad: vec4f) -> VOut {
 // Flower heads painted on the ground: one chance of a dot per 0.45 m cell. When a pixel
 // covers more than a few cells the dots are replaced by their average cover, so a drift
 // of flowers still tints the meadow from far away without sparkling.
-fn flower_dots(p: vec2f, amount: f32, fp: f32) -> f32 {
+fn flower_dots(p: vec2f, amount: f32, fp: f32, dist: f32) -> f32 {
     let cell = 0.45;
-    let density = amount * flower_drift(p) * 0.7;
+    // near the camera the flowers stand in the grass as real heads (grass_gen.wgsl, which
+    // thins them out over the same distances)
+    let density = amount * flower_drift(p) * 0.7 * smoothstep(GRASS_NEAR, GRASS_FAR, dist);
     let avg = density * 0.12;
     let far = smoothstep(0.04, 0.2, fp);
     if (far >= 1.0 || density < 0.003) {
@@ -77,89 +79,27 @@ fn sward(p: vec2f, fp: f32) -> vec3f {
     return acc;
 }
 
-struct Litter {
-    col: vec3f,
-    tilt: vec2f, // where the leaves curl: added to the ground normal's x and z
-}
+// What each ground scan covers (m), from the Poly Haven metadata.
+const TILE_LEAVES: f32 = 1.5;
+const TILE_MOSS: f32 = 1.3;
+const TILE_GRASS: f32 = 2.0;
+const TILE_SOIL: f32 = 3.15;
+const TILE_ROCK: f32 = 2.7;
 
-// Fallen leaves in three overlapping layers (the top one wins), with twigs on top. Each leaf
-// is a pointed oval with a midrib, brown to ochre, the odd one russet or dark and rotting.
-// A leaf's centre stays in the middle half of its cell and it is at most 1.5 cells long, so
-// the 2x2 cells around a point are the only ones that can reach it. Where a pixel covers
-// several leaves it all fades to the average colour, so it doesn't sparkle.
-fn litter(p: vec2f, fp: f32) -> Litter {
-    var out: Litter;
-    out.col = vec3f(0.085, 0.064, 0.042);
-    out.tilt = vec2f(0.0);
-    let far = smoothstep(0.02, 0.08, fp);
+// One ground scan at p, mapped from above. Up close it is hex-tiled (no repeats); once a pixel
+// spans a good part of a tile the detail has nothing left to show but its tiling and shimmer,
+// so it fades to the scan's average, which the coarsest mip holds: the far ground keeps the
+// near ground's average colour by construction.
+fn ground_mat(layer: i32, tile: f32, p: vec2f, dpx: vec2f, dpy: vec2f, fp: f32, seed: i32) -> MatSample {
+    let far = smoothstep(tile * 0.08, tile * 0.3, fp);
     if (far >= 1.0) {
-        return out;
+        return mat_mean(layer);
     }
-    var col = vec3f(0.035, 0.028, 0.02); // humus between the leaves
-    var tilt = vec2f(0.0);
-    for (var layer = 0; layer < 3; layer++) {
-        let cell = 0.1 + f32(layer) * 0.025;
-        let q = p / cell + vec2f(f32(layer) * 17.31, f32(layer) * -9.71);
-        let base = vec2i(floor(q - 0.5));
-        for (var j = 0; j < 4; j++) {
-            let ci = base + vec2i(j & 1, j >> 1);
-            let h = hash_i2(ci + vec2i(layer * 4099, 1237));
-            let c = vec2f(ci) + 0.25 + 0.5 * vec2f(u01(h), u01(pcg(h)));
-            let a = u01(pcg(h + 7u)) * TAU;
-            let dir = vec2f(cos(a), sin(a));
-            let rel = (q - c) * cell;
-            let u = dot(rel, dir);
-            let v = dot(rel, vec2f(-dir.y, dir.x));
-            let len = cell * mix(0.4, 0.75, u01(pcg(h + 3u)));
-            let t = u / len;
-            if (abs(t) >= 1.0) {
-                continue;
-            }
-            let half_w = len * 0.45 * sqrt(1.0 - t * t) * (1.0 - 0.35 * t);
-            let cov = smoothstep(-fp, fp, half_w - abs(v));
-            if (cov <= 0.0) {
-                continue;
-            }
-            let r = u01(pcg(h + 11u));
-            // grey-brown, the odd ochre or russet one, many dark and rotting
-            var lc = mix(vec3f(0.095, 0.072, 0.05), vec3f(0.15, 0.115, 0.075), r);
-            lc = mix(lc, vec3f(0.19, 0.13, 0.06), step(0.85, r));
-            lc = mix(lc, vec3f(0.15, 0.07, 0.035), step(0.97, r));
-            lc = mix(lc, vec3f(0.05, 0.04, 0.03), smoothstep(0.4, 0.75, u01(pcg(h + 13u))));
-            lc *= 1.0 - 0.3 * (1.0 - smoothstep(0.0, fp + 0.004, abs(v)));
-            col = mix(col, lc, cov);
-            // curled up along the length and across, at random
-            let curl = vec2f(-dir.y, dir.x) * (v / half_w) * 0.5 + dir * t * 0.35;
-            tilt = mix(tilt, curl * (u01(pcg(h + 17u)) - 0.3), cov);
-        }
+    let m = mat_hex(layer, p / tile, dpx / tile, dpy / tile, seed);
+    if (far <= 0.0) {
+        return m;
     }
-    // twigs
-    let tcell = 0.7;
-    let tq = p / tcell;
-    let tbase = vec2i(floor(tq - 0.5));
-    for (var j = 0; j < 4; j++) {
-        let ci = tbase + vec2i(j & 1, j >> 1);
-        let h = hash_i2(ci + vec2i(-771, 5003));
-        if (u01(h) > 0.45) {
-            continue;
-        }
-        let c = vec2f(ci) + 0.25 + 0.5 * vec2f(u01(pcg(h)), u01(pcg(h + 1u)));
-        let a = u01(pcg(h + 2u)) * TAU;
-        let dir = vec2f(cos(a), sin(a));
-        let rel = (tq - c) * tcell;
-        let u = dot(rel, dir);
-        let len = tcell * mix(0.25, 0.7, u01(pcg(h + 3u)));
-        if (abs(u) >= len) {
-            continue;
-        }
-        let w = mix(0.004, 0.011, u01(pcg(h + 4u))) * (1.0 - 0.5 * abs(u) / len);
-        let v = dot(rel, vec2f(-dir.y, dir.x)) + sin(u * 23.0 + a) * 0.006;
-        let cov = smoothstep(fp, -fp, abs(v) - w) * min(w / fp, 1.0);
-        col = mix(col, vec3f(0.10, 0.08, 0.06), cov);
-    }
-    out.col = mix(col, out.col, far);
-    out.tilt = tilt * (1.0 - far);
-    return out;
+    return mat_mix(m, mat_mean(layer), far);
 }
 
 // The occluder pass: depth only (the colour target is there for the trees' alpha-to-coverage).
@@ -174,9 +114,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let V = (F.cam_pos.xyz - in.wp) / max(dist, 1e-3);
     // metres covered by this pixel: between the area-based size and the long axis, since at
     // a grazing angle the long axis alone would blur the detail out far too early
-    let ax = length(dpdx(p));
-    let ay = length(dpdy(p));
+    let dpx = dpdx(p);
+    let dpy = dpdy(p);
+    let ax = length(dpx);
+    let ay = length(dpy);
     let fp = max(mix(sqrt(ax * ay), max(ax, ay), 0.25), 1e-4);
+    // the share of the sky the ground sees, terrain and forest
     let vis = sky_vis(p);
 
     // macro normal from the baked map + procedural micro detail up close; beyond 140 m the
@@ -196,48 +139,85 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let rock = dat.y;
     let flowers = dat.z;
     let nz = fbm(p * 0.08, 3) * 0.5 + 0.5;
-    let nz2 = gnoise(p * 0.9) * 0.5 + 0.5;
 
-    // --- meadow
+    // --- where each ground goes (the same masks as before the scans)
     let sw = sward(p, fp);
-    var grass = meadow_tint(p, dat, nm, vis);
-    // seen from above, the gaps between blades are darker than the blades
-    grass *= 1.0 + 0.75 * sw.x;
-    grass = mix(grass, flower_color(p), flower_dots(p, flowers, fp));
-
-    // --- bare soil: a band on the steeper slopes before the rock, and small worn patches
+    // bare soil: a band on the steeper slopes before the rock, and small worn patches
     let ragged = fbm(p * 0.35, 3);
     let worn = smoothstep(0.72, 0.95, gnoise(p * 0.06 + vec2f(7.0, -3.0)) + (nz - 0.5) * 0.5 + ragged * 0.35) * 0.75;
     var soil_amt = clamp(smoothstep(0.14, 0.26, slope + (nz - 0.5) * 0.12 + ragged * 0.05) + worn, 0.0, 1.0);
     // tufts of grass break through a bare patch
     soil_amt = smoothstep(0.3, 0.8, soil_amt + (sw.x + ragged) * 0.3 * (1.0 - soil_amt)) * 0.9;
-    let soil_c = mix(vec3f(0.085, 0.066, 0.046), vec3f(0.135, 0.105, 0.072), nz2) * (0.85 + 0.25 * nz) * (1.0 + 0.2 * sw.x);
-    var ground = mix(grass, soil_c, soil_amt);
-
-    // --- forest floor: leaf litter, twigs, moss
     let wood = smoothstep(0.35, 0.75, forest);
-    var floor_c = mix(vec3f(0.10, 0.07, 0.04), vec3f(0.19, 0.13, 0.075), nz2) * (0.8 + 0.3 * nz);
-    var curl = vec2f(0.0);
-    if (wood > 0.0) {
-        let lt = litter(p, fp);
-        floor_c = lt.col * (0.8 + 0.4 * nz);
-        curl = lt.tilt;
-    }
-    floor_c = mix(floor_c, vec3f(0.05, 0.10, 0.025), smoothstep(0.55, 0.8, nz) * 0.6);
-    var albedo = mix(ground, floor_c, wood);
-
-    let rock_c = mix(vec3f(0.11, 0.105, 0.10), vec3f(0.22, 0.21, 0.19), nz2) * (0.75 + 0.35 * nz);
+    // moss where the floor is damper
+    let moss_amt = smoothstep(0.5, 0.8, nz + ragged * 0.15) * 0.75;
     let rock_amt = smoothstep(0.4, 0.7, rock + (nz - 0.5) * 0.3);
-    albedo = mix(albedo, rock_c, rock_amt);
+    var w = array<f32, 5>(
+        wood * (1.0 - moss_amt) * (1.0 - rock_amt), // leaves
+        wood * moss_amt * (1.0 - rock_amt),         // moss
+        (1.0 - wood) * (1.0 - soil_amt) * (1.0 - rock_amt), // grass
+        (1.0 - wood) * soil_amt * (1.0 - rock_amt), // soil
+        rock_amt,
+    );
+    let layers = array<i32, 5>(MAT_LEAVES, MAT_MOSS, MAT_GRASS, MAT_SOIL, MAT_ROCK);
+    let tiles = array<f32, 5>(TILE_LEAVES, TILE_MOSS, TILE_GRASS, TILE_SOIL, TILE_ROCK);
+
+    // --- the scans, each under the large-scale colour changes the ground had before them
+    var grass_tint = meadow_tint(p, dat, nm, vis) / max(mat_mean(MAT_GRASS).a.rgb, vec3f(1e-3));
+    // seen from above, the gaps between blades are darker than the blades
+    grass_tint *= 1.0 + 0.75 * sw.x;
+    let tints = array<vec3f, 5>(
+        vec3f(0.8 + 0.4 * nz),
+        vec3f(0.8 + 0.4 * nz),
+        grass_tint,
+        vec3f((0.85 + 0.25 * nz) * (1.0 + 0.2 * sw.x) / 0.975),
+        vec3f((0.75 + 0.35 * nz) / 0.925),
+    );
+    var s: array<MatSample, 5>;
+    // Height blend: where two grounds meet, whichever stands higher there shows (leaves lie on
+    // the moss, grass tufts poke through soil, rock juts out).
+    var top = -1.0;
+    for (var i = 0; i < 5; i++) {
+        if (w[i] > 0.02) {
+            s[i] = ground_mat(layers[i], tiles[i], p, dpx, dpy, fp, i);
+            s[i].a = vec4f(s[i].a.rgb * tints[i], s[i].a.w);
+            top = max(top, w[i] + s[i].a.w * 0.5);
+        }
+    }
+    var sum = 0.0;
+    for (var i = 0; i < 5; i++) {
+        if (w[i] > 0.02) {
+            w[i] = max(w[i] + s[i].a.w * 0.5 - (top - 0.15), 0.0);
+            sum += w[i];
+        } else {
+            w[i] = 0.0;
+        }
+    }
+    var mat: MatSample;
+    mat.a = vec4f(0.0);
+    mat.b = vec4f(0.0);
+    for (var i = 0; i < 5; i++) {
+        if (w[i] > 0.0) {
+            let k = w[i] / sum;
+            mat.a += s[i].a * k;
+            mat.b += s[i].b * k;
+        }
+    }
+    var albedo = mat.a.rgb;
+    // flower heads painted on the meadow
+    albedo = mix(albedo, flower_color(p), flower_dots(p, flowers, fp, dist) * (w[2] / sum));
 
     // grass cover decides how much the sward relief and the sward's look apply
-    let grassy = (1.0 - wood) * (1.0 - rock_amt) * (1.0 - soil_amt * 0.7);
+    let grassy = w[2] / sum;
     n = normalize(n + vec3f(-sw.y, 0.0, -sw.z) * mix(0.35, 1.0, grassy));
-    n = normalize(n + vec3f(curl.x, 0.0, curl.y) * wood * (1.0 - rock_amt));
+    // the scans' normal maps (u along +x, v along +z)
+    n = normalize(n + vec3f(mat.b.x, 0.0, mat.b.y));
+    let rough = mat.b.z;
+    let tex_ao = mat.b.w;
 
     let L = F.sun_dir.xyz;
     let ndl = max(dot(n, L), 0.0);
-    let sh = shadow_at(in.wp, n);
+    let sh = shadow_at(in.wp, nm);
     // far away there is no shadow map: darken dense forest floor instead
     let canopy = mix(1.0, 0.35, smoothstep(0.45, 0.85, forest) * smoothstep(F.cascade.y * 0.6, F.cascade.y, dist));
 
@@ -250,11 +230,14 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let hot = exp(-(1.0 - vl) * 18.0) * 0.35;
     let back = pow(saturate(-vl), 6.0) * 0.4 * smoothstep(0.0, 0.2, L.y);
     let sward_look = mix(1.0, grazing, grassy);
-    let direct = sun_light(in.wp) * sh * canopy * (ndl * (1.0 + hot * grassy) + back * grassy);
-    let amb = ambient_vis(n, in.wp, vis);
+    let sun = sun_light(in.wp) * sh * canopy * micro_shadow(tex_ao, ndl);
+    let direct = sun * (ndl * (1.0 + hot * grassy) + back * grassy);
+    let amb = ambient_vis(n, in.wp, vis) * tex_ao;
     // blades are a little glossy: at a grazing angle the sward picks up a sheen of sky
     let sheen = SKY.amb_up.rgb * F.sun_color.w * vis * 0.05 * pow(1.0 - ndv, 4.0) * grassy;
     var col = albedo * sward_look * (direct + amb) + sheen;
+    // wet leaves and bare rock catch the sun (the sward's own gloss is the sheen above)
+    col += sun * sun_specular(n, V, L, rough) * (1.0 - grassy);
     col = apply_fog(col, in.wp);
     return vec4f(col, 1.0);
 }
@@ -317,9 +300,9 @@ fn fs_canopy(in: CanopyOut) -> @location(0) vec4f {
 
     let h = in.ground;
     let spruce = smoothstep(250.0, 380.0, h + fbm(p * 0.0022 + vec2f(-41.0, 17.0), 3) * 140.0);
-    var albedo = mix(vec3f(0.04, 0.08, 0.014), vec3f(0.022, 0.042, 0.02), spruce);
+    var albedo = mix(vec3f(0.043, 0.08, 0.014), vec3f(0.022, 0.042, 0.02), spruce);
     let birchy = smoothstep(0.12, 0.32, fbm(p * 0.0022 + vec2f(-41.0, 17.0), 3)) * (1.0 - spruce);
-    albedo = mix(albedo, vec3f(0.06, 0.10, 0.02), birchy * 0.6);
+    albedo = mix(albedo, vec3f(0.065, 0.10, 0.02), birchy * 0.6);
     let tint = gnoise(p * 0.07) * 0.5 + 0.5;
     albedo *= mix(0.75, 1.1, tint);
     // gaps between crowns are darker

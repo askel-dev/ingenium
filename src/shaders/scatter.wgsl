@@ -2,7 +2,9 @@
 // equal to the forest density from the world data map. Writes a compact tree list.
 //
 // Tree record (vec4u): xyz = bitcast position, w = packed
-//   bits 0-1 species, 2-9 rotation, 10-17 scale, 18-31 seed
+//   bits 0-1 species, 2-9 rotation, 10-17 scale, 18-19 variant, 20-31 seed
+// Variants (treegen.rs): 0, 1 forest-grown, 2 open-grown (low, wide branching: lone trees and
+// the forest's edge), 3 young (the edge's mantle, gaps in the canopy).
 
 struct Scatter {
     cell: f32,
@@ -27,6 +29,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let h3 = pcg(h2);
     let h4 = pcg(h3);
     let h5 = pcg(h4);
+    let h6 = pcg(h5);
     let p = (vec2f(cell) + 0.05 + vec2f(u01(h0), u01(h1)) * 0.9) * S.cell;
     if (p.x < 8.0 || p.y < 8.0 || p.x > F.world.x - 8.0 || p.y > F.world.x - 8.0) {
         return;
@@ -37,11 +40,48 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // A closed forest still has gaps: where an old tree fell, thinner stands. They let
     // sunflecks through to the floor.
     let gaps = mix(0.45, 1.0, smoothstep(-0.35, 0.2, gnoise(p * 0.03 + vec2f(5.1, -2.3))));
-    var density = dat.x * 0.85 * gaps + 0.003;
-    density *= 1.0 - smoothstep(0.22, 0.4, 1.0 - n.y);
-    density *= 1.0 - dat.y * 0.85;
+    let ground = (1.0 - smoothstep(0.22, 0.4, 1.0 - n.y)) * (1.0 - dat.y * 0.85);
+    let density = (dat.x * 0.85 * gaps + 0.003) * ground;
+    // the forest a stone's throw away, all round: a tree with open ground beside it stands at
+    // an edge, one with little forest around it in the open, and a spot with forest beside it
+    // but none here is just outside one
+    var near_min = 1.0;
+    var near_max = 0.0;
+    var near_avg = 0.0;
+    for (var k = 0; k < 6; k++) {
+        let a = f32(k) * 1.0472 + u01(h0) * 1.0472;
+        let q1 = data_at(p + vec2f(cos(a), sin(a)) * 14.0).x;
+        let q2 = data_at(p + vec2f(cos(a + 0.52), sin(a + 0.52)) * 30.0).x;
+        near_min = min(near_min, q1);
+        near_max = max(near_max, max(q1, q2));
+        near_avg += (q1 + q2) / 12.0;
+    }
+    var variant = 0u;
     if (u01(h2) >= density) {
-        return;
+        // No tree here, but just outside a forest: the mantle of young trees and bushes that
+        // thickens its edge down to the ground.
+        let mantle = smoothstep(0.45, 0.8, near_max) * (1.0 - smoothstep(0.25, 0.5, dat.x)) * ground;
+        if (u01(h6) >= mantle * 0.5) {
+            return;
+        }
+        variant = 3u;
+    } else {
+        // trees standing in the open, and those at the edge, grew in the light: low and wide
+        let lone = 1.0 - smoothstep(0.2, 0.55, min(near_avg, dat.x + 0.15));
+        let edge = smoothstep(0.45, 0.85, 1.0 - near_min);
+        let open_p = max(saturate((lone - 0.2) * 2.0), edge * 0.6);
+        // young trees come up at edges and where the canopy has a gap (and a few in the open)
+        let young_p = 0.06 + 0.25 * edge * (1.0 - lone) + 0.2 * (1.0 - gaps) / 0.55;
+        let r = u01(h6);
+        if (lone > 0.5 && u01(pcg(h6)) < 0.12) {
+            variant = 3u;
+        } else if (r < open_p) {
+            variant = 2u;
+        } else if (r < open_p + young_p * (1.0 - open_p)) {
+            variant = 3u;
+        } else {
+            variant = (h6 >> 7u) & 1u;
+        }
     }
 
     // species: spruce up high, birch in patches and along forest edges, broadleaf elsewhere
@@ -60,8 +100,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let rot = h5 & 255u;
     let scale_q = (h4 >> 8u) & 255u;
-    let seed = (h5 >> 8u) & 0x3FFFu;
-    let packed = species | (rot << 2u) | (scale_q << 10u) | (seed << 18u);
+    let seed = (h5 >> 8u) & 0xFFFu;
+    let packed = species | (rot << 2u) | (scale_q << 10u) | (variant << 18u) | (seed << 20u);
 
     let slot = atomicAdd(&counter[0], 1u);
     if (slot >= S.cap) {

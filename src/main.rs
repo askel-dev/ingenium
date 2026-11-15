@@ -7,12 +7,14 @@ mod bloom;
 mod camera;
 mod clouds;
 mod exposure;
+mod foliage;
 mod forest;
 mod gpu;
 mod grass;
 mod hiz;
 mod hud;
-mod leaftex;
+mod impostor;
+mod materials;
 mod player;
 mod renderer;
 mod sky;
@@ -61,11 +63,13 @@ struct Args {
     vsync: bool,
     lod_tint: bool,
     ssao: bool,
+    grass: bool,
     hud: bool,
     /// Render scale; None in a window means one scene pixel per point (half on Retina).
     scale: Option<f32>,
     prepass: bool,
     occlusion: bool,
+    lod: [f32; 2],
     leaf_png: Option<String>,
 }
 
@@ -83,10 +87,12 @@ fn parse_args() -> Args {
         vsync: true,
         lod_tint: false,
         ssao: true,
+        grass: true,
         hud: false,
         scale: None,
         prepass: true,
         occlusion: true,
+        lod: forest::LOD_DIST,
         leaf_png: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -118,11 +124,19 @@ fn parse_args() -> Args {
             "--novsync" => a.vsync = false,
             "--lod-tint" => a.lod_tint = true,
             "--no-ao" => a.ssao = false,
+            "--no-grass" => a.grass = false,
             "--hud" => a.hud = true,
             "--no-prepass" => a.prepass = false,
             "--no-occlusion" => a.occlusion = false,
             "--scale" => { a.scale = next(i).parse().ok(); i += 1; }
             "--leaf-png" => { a.leaf_png = Some(next(i)); i += 1; }
+            "--lod" => {
+                let v: Vec<f32> = next(i).split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 2 {
+                    a.lod = [v[0], v[1]];
+                }
+                i += 1;
+            }
             other => eprintln!("unknown argument: {other}"),
         }
         i += 1;
@@ -133,8 +147,8 @@ fn parse_args() -> Args {
 fn main() {
     let args = parse_args();
     if let Some(p) = &args.leaf_png {
-        leaftex::debug_png(p);
-        println!("wrote {p}");
+        foliage::debug_png(p);
+        println!("wrote {p}_<layer>.png");
         return;
     }
     if args.capture.is_some() {
@@ -161,8 +175,10 @@ fn capture(args: &Args) {
     r.settings.sun_shift = args.sun_shift;
     r.settings.lod_tint = args.lod_tint;
     r.settings.ssao = args.ssao;
+    r.settings.grass = args.grass;
     r.settings.prepass = args.prepass;
     r.settings.occlusion = args.occlusion;
+    r.settings.lod = args.lod;
     if let Some(s) = args.scale {
         r.set_scale(&gpu.device, s);
     }
@@ -292,18 +308,18 @@ fn fmt_count(n: u64) -> String {
 
 fn stats_line(r: &Renderer) -> String {
     let s = &r.stats;
-    let mut lod = [0u64; 4];
+    let mut lod = [0u64; forest::LODS];
     for (d, n) in s.visible.iter().enumerate() {
-        lod[d % 4] += *n as u64;
+        lod[forest::draw_lod(d)] += *n as u64;
     }
     format!(
-        "trees {} · drawn L0 {} L1 {} L2 {} L3 {} · grass {} · {} tris",
+        "trees {} · drawn L0 {} L1 {} impostors {} · grass {} + {} cards · {} tris",
         fmt_count(r.forest.tree_count as u64),
         fmt_count(lod[0]),
         fmt_count(lod[1]),
         fmt_count(lod[2]),
-        fmt_count(lod[3]),
         fmt_count(s.grass as u64),
+        fmt_count(s.grass_cards as u64),
         fmt_count(s.tris)
     )
 }
@@ -358,8 +374,10 @@ impl App {
         renderer.settings.sun_shift = self.args.sun_shift;
         renderer.settings.lod_tint = self.args.lod_tint;
         renderer.settings.ssao = self.args.ssao;
+        renderer.settings.grass = self.args.grass;
         renderer.settings.prepass = self.args.prepass;
         renderer.settings.occlusion = self.args.occlusion;
+        renderer.settings.lod = self.args.lod;
         renderer.set_scale(&gpu.device, self.args.scale.unwrap_or(1.0 / window.scale_factor() as f32));
         let hud = hud::Hud::new(&gpu.device, format);
         let path = FlyPath::new(&renderer.terrain);

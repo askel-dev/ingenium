@@ -10,6 +10,7 @@ glam = { version = "0.34.2", features = ["bytemuck"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"
 png = "0.18.1"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.dev]
 opt-level = 1

@@ -37,6 +37,13 @@ struct Frame {
 @group(0) @binding(12) var t_cloud_shadow: texture_2d<f32>;
 @group(0) @binding(13) var t_ap_scat: texture_3d<f32>;
 @group(0) @binding(14) var t_ap_trans: texture_3d<f32>;
+// Scanned materials (materials.rs): a = albedo rgb + height, b = normal xy + roughness + AO.
+@group(0) @binding(15) var t_mat_a: texture_2d_array<f32>;
+@group(0) @binding(16) var t_mat_b: texture_2d_array<f32>;
+@group(0) @binding(17) var s_mat: sampler;
+// The foliage's normals (foliage.rs): normal xy (+x along u, +y along v), roughness, translucency.
+// (t_leaf, binding 7, holds its albedo and coverage.)
+@group(0) @binding(18) var t_leaf_n: texture_2d_array<f32>;
 
 // Aerial perspective volume (aerial.wgsl): froxels over the screen, slice i at distance
 // AP_DIST * ((i + 0.5) / slices)^2, so the near slices are finer.
@@ -259,6 +266,11 @@ fn meadow_tint(p: vec2f, dat: vec4f, n: vec3f, vis: f32) -> vec3f {
     return c;
 }
 
+// The grass blades (and the flowers among them) thin out between these distances (m) from
+// the camera (grass_gen.wgsl, grass.rs); the ground paints the flowers beyond.
+const GRASS_NEAR: f32 = 10.4;
+const GRASS_FAR: f32 = 26.0;
+
 // Wild flowers grow in drifts of one kind: buttercups, daisies or violet clover.
 fn flower_drift(p: vec2f) -> f32 {
     return smoothstep(-0.15, 0.45, gnoise(p * 0.12 + vec2f(4.0, 1.5)));
@@ -270,4 +282,130 @@ fn flower_color(p: vec2f) -> vec3f {
     c = mix(c, vec3f(0.78, 0.78, 0.72), smoothstep(-0.05, 0.15, kind));
     c = mix(c, vec3f(0.34, 0.15, 0.48), smoothstep(0.35, 0.5, kind));
     return c;
+}
+
+// ---------------------------------------------------------------------------
+// Scanned materials. Layers, in the order of materials.rs; the sizes (m) are what each scan
+// covers, from the Poly Haven metadata.
+
+const MAT_LEAVES: i32 = 3;
+const MAT_MOSS: i32 = 4;
+const MAT_GRASS: i32 = 5;
+const MAT_SOIL: i32 = 6;
+const MAT_ROCK: i32 = 7;
+// coarsest mip: the layer's average (albedo, height, roughness, AO)
+const MAT_MEAN_LOD: f32 = 11.0;
+
+struct MatSample {
+    a: vec4f, // albedo, height
+    b: vec4f, // normal x, y in -1..1 (+x along u, +y along v), roughness, AO
+}
+
+fn mat_fetch(layer: i32, uv: vec2f, dx: vec2f, dy: vec2f) -> MatSample {
+    var m: MatSample;
+    m.a = textureSampleGrad(t_mat_a, s_mat, uv, layer, dx, dy);
+    let b = textureSampleGrad(t_mat_b, s_mat, uv, layer, dx, dy);
+    m.b = vec4f(b.xy * 2.0 - 1.0, b.zw);
+    return m;
+}
+
+fn mat_mean(layer: i32) -> MatSample {
+    var m: MatSample;
+    m.a = textureSampleLevel(t_mat_a, s_mat, vec2f(0.5), layer, MAT_MEAN_LOD);
+    let b = textureSampleLevel(t_mat_b, s_mat, vec2f(0.5), layer, MAT_MEAN_LOD);
+    m.b = vec4f(b.xy * 2.0 - 1.0, b.zw);
+    return m;
+}
+
+fn mat_mix(x: MatSample, y: MatSample, t: f32) -> MatSample {
+    var m: MatSample;
+    m.a = mix(x.a, y.a, t);
+    m.b = mix(x.b, y.b, t);
+    return m;
+}
+
+// Hex-tiling (after Mikkelsen 2022, "Practical real-time hex-tiling"): the plane is cut into
+// a triangle grid, every grid vertex takes the texture at a random rotation and offset, and a
+// point blends the three around it, favouring the one whose surface stands highest there. No
+// tile repeats, and the seams follow the scan's own relief. uv in tiles, dx/dy its gradients;
+// the returned normal is turned back to the uv axes.
+fn mat_hex(layer: i32, uv: vec2f, dx: vec2f, dy: vec2f, seed: i32) -> MatSample {
+    // grid cells about 0.6 tiles across
+    let st = uv * 1.9;
+    let skew = vec2f(st.x - 0.57735027 * st.y, 1.15470054 * st.y);
+    let base = vec2i(floor(skew));
+    let f = fract(skew);
+    let z = 1.0 - f.x - f.y;
+    var w: vec3f;
+    var v0: vec2i;
+    var v1: vec2i;
+    var v2: vec2i;
+    if (z > 0.0) {
+        w = vec3f(z, f.y, f.x);
+        v0 = base;
+        v1 = base + vec2i(0, 1);
+        v2 = base + vec2i(1, 0);
+    } else {
+        w = vec3f(-z, 1.0 - f.y, 1.0 - f.x);
+        v0 = base + vec2i(1, 1);
+        v1 = base + vec2i(1, 0);
+        v2 = base + vec2i(0, 1);
+    }
+    // Sharpened up front, so a grid vertex whose share is negligible here isn't sampled at all
+    // (most of the plane is near one vertex; only the seams take two or three lookups).
+    var wb = w * w;
+    wb *= wb;
+    wb /= wb.x + wb.y + wb.z;
+    let vs = array<vec2i, 3>(v0, v1, v2);
+    var m: MatSample;
+    m.a = vec4f(0.0);
+    m.b = vec4f(0.0);
+    var total = 0.0;
+    for (var i = 0; i < 3; i++) {
+        if (wb[i] < 0.05) {
+            continue;
+        }
+        let h = hash_i2(vs[i] + vec2i(seed * 7919, layer * 104729));
+        let ang = u01(h) * TAU;
+        let cs = vec2f(cos(ang), sin(ang));
+        let rot = mat2x2f(cs.x, cs.y, -cs.y, cs.x);
+        let off = vec2f(u01(pcg(h + 1u)), u01(pcg(h + 2u)));
+        var t = mat_fetch(layer, rot * uv + off, rot * dx, rot * dy);
+        // back from the rotated texture's axes (rot is orthonormal: its inverse is its transpose)
+        t.b = vec4f(transpose(rot) * t.b.xy, t.b.zw);
+        // the higher surface wins the seam
+        let k = pow(wb[i] * (t.a.w + 0.35), 3.0);
+        m.a += t.a * k;
+        m.b += t.b * k;
+        total += k;
+    }
+    m.a /= total;
+    m.b /= total;
+    return m;
+}
+
+// Sun specular (GGX, Smith, Schlick, F0 = 0.04 for a dielectric), as a factor on the sun light
+// the way the diffuse terms use it (albedo * sun * n.l), so it carries the pi of the BRDF.
+fn sun_specular(n: vec3f, v: vec3f, l: vec3f, rough: f32) -> f32 {
+    let nl = dot(n, l);
+    let nv = max(dot(n, v), 1e-3);
+    if (nl <= 0.0) {
+        return 0.0;
+    }
+    let h = normalize(v + l);
+    let nh = max(dot(n, h), 0.0);
+    let a = max(rough * rough, 0.02);
+    let a2 = a * a;
+    let dd = nh * nh * (a2 - 1.0) + 1.0;
+    let d = a2 / (PI * dd * dd);
+    let kk = (rough + 1.0) * (rough + 1.0) / 8.0;
+    let g = nl / (nl * (1.0 - kk) + kk) * nv / (nv * (1.0 - kk) + kk);
+    let fr = 0.04 + 0.96 * pow(1.0 - saturate(dot(h, v)), 5.0);
+    return d * g * fr / (4.0 * nv) * PI;
+}
+
+// Light that a crevice still lets in from the sun, from the map's AO (Brinkman's micro-shadow
+// approximation): a fully open texel is untouched, a deep one only lit when facing the sun.
+fn micro_shadow(ao: f32, nl: f32) -> f32 {
+    return saturate(nl + 2.0 * ao * ao - 1.0);
 }

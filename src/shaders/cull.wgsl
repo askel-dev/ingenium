@@ -1,6 +1,8 @@
 // Per-frame GPU culling + LOD selection. One thread per tree: frustum test, pick a
-// LOD from distance, then append the tree index into that (species, LOD) bucket and
-// bump the bucket's indirect instance count. The CPU never looks at individual trees.
+// LOD from distance, then append the tree index into that (kind, LOD) bucket and bump the
+// bucket's indirect instance count. A kind is a species' variant (treegen.rs); its two mesh
+// LODs have a bucket each, and the impostors of every kind share the last one. The CPU never
+// looks at individual trees.
 //
 // The camera culls in two passes. The first appends only the near LODs, which are drawn
 // first as occluders; the second, after a depth pyramid has been built from them and the
@@ -13,10 +15,10 @@ const MODE_OCCLUDED = 2u;   // only the LODs from counts.z up, if not hidden in 
 struct Cull {
     planes: array<vec4f, 8>,   // unused ones are (0, 0, 0, 1)
     cam: vec4f,                 // xyz LOD reference position, w = max draw distance
-    lod: vec4f,                 // x,y,z LOD switch distances, w = LOD bias
+    lod: vec4f,                 // x, y = where LOD1 and the impostors start, w = LOD bias
     counts: vec4u,              // x = tree count, y = mode, z = LODs drawn as occluders
-    regions: array<vec4u, 12>,  // x = first slot in visible[], y = capacity
-    bounds: array<vec4f, 4>,    // per species: x = sphere centre height, y = radius
+    regions: array<vec4u, 25>,  // per bucket: x = first slot in visible[], y = capacity
+    bounds: array<vec4f, 12>,   // per kind: x = sphere centre height, y = radius
     view: mat4x4f,              // the camera, for the occlusion test
     proj: vec4f,                // x, y = the projection's x and y scale, z = near plane
     hiz: vec4f,                 // depth pyramid: screen width and height in pixels, levels
@@ -27,6 +29,8 @@ struct Cull {
 @group(1) @binding(2) var<storage, read_write> args: array<atomic<u32>>;
 @group(1) @binding(3) var<storage, read_write> visible: array<u32>;
 @group(1) @binding(4) var hiz: texture_2d<f32>;
+
+const IMP_DRAW = 24u;
 
 fn tree_scale(packed: u32) -> f32 {
     return 0.75 + f32((packed >> 10u) & 255u) / 255.0 * 0.55;
@@ -91,8 +95,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg:
     let pos = bitcast<vec3f>(t.xyz);
     let packed = t.w;
     let species = packed & 3u;
+    let kind = species * 4u + ((packed >> 18u) & 3u);
     let scale = tree_scale(packed);
-    let b = C.bounds[species];
+    let b = C.bounds[kind];
     let center = pos + vec3f(0.0, b.x * scale, 0.0);
     let radius = b.y * scale;
     for (var k = 0; k < 8; k++) {
@@ -107,17 +112,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg:
     if (dist - radius > cutoff) {
         return;
     }
-    let jitter = 1.0 + (u01(pcg(packed)) - 0.5) * 0.25;
+    // (as tree.wgsl's `lod_estimate`)
+    let jitter = 1.0 + (u01(pcg((packed >> 20u) * 977u + species)) - 0.5) * 0.25;
     let d = dist / scale * jitter;
-    var lod = 3u;
+    var lod = 2u;
     if (d < C.lod.x) {
         lod = 0u;
     } else if (d < C.lod.y) {
         lod = 1u;
-    } else if (d < C.lod.z) {
-        lod = 2u;
     }
-    lod = min(lod + u32(C.lod.w), 3u);
+    lod = min(lod + u32(C.lod.w), 2u);
     let mode = C.counts.y;
     if (mode == MODE_OCCLUDERS && lod >= C.counts.z) {
         return;
@@ -125,7 +129,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgroups) nwg:
     if (mode == MODE_OCCLUDED && (lod < C.counts.z || occluded(center, radius))) {
         return;
     }
-    let draw = species * 4u + lod;
+    let draw = select(kind * 2u + lod, IMP_DRAW, lod == 2u);
     let reg = C.regions[draw];
     let slot = atomicAdd(&args[draw * 5u + 1u], 1u);
     if (slot >= reg.y) {

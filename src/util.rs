@@ -7,6 +7,8 @@ pub const NOISE_WGSL: &str = include_str!("shaders/noise.wgsl");
 pub const ATMO_WGSL: &str = include_str!("shaders/atmo_common.wgsl");
 /// The per-frame globals; they read the atmosphere tables, so they bring the atmosphere code along.
 pub const GLOBALS_WGSL: &str = concat!(include_str!("shaders/atmo_common.wgsl"), include_str!("shaders/globals.wgsl"));
+/// Tree record decoding, bark, tint, leaf and bark lighting, impostor frames (tree.wgsl and the impostor bake).
+pub const TREE_COMMON_WGSL: &str = include_str!("shaders/tree_common.wgsl");
 
 pub fn uniform_entry(binding: u32, visibility: ShaderStages) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {

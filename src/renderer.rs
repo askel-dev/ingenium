@@ -4,12 +4,13 @@
 use crate::bloom::Bloom;
 use crate::camera::Camera;
 use crate::clouds::Clouds;
-use crate::forest::{Forest, TreePass, ViewSetup, CULL_PLANES, DRAWS, LODS, OCCLUDER_LODS};
+use crate::forest::{Forest, TreePass, ViewSetup, CULL_PLANES, DRAWS, LODS, LOD_DIST, OCCLUDER_LODS};
 use crate::hiz::Hiz;
 use crate::exposure::Exposure;
 use crate::grass::Grass;
 use crate::undergrowth::Undergrowth;
-use crate::leaftex;
+use crate::foliage::{self, Foliage};
+use crate::materials::Materials;
 use crate::sky::{Sky, SkyParams};
 use crate::ssao::Ssao;
 use crate::terrain::{Terrain, HM_RES, PATCH_TRIS, WORLD};
@@ -24,7 +25,6 @@ pub const HDR: TextureFormat = TextureFormat::Rgba16Float;
 const DEPTH: TextureFormat = TextureFormat::Depth32Float;
 const SHADOW_RES: u32 = 2048;
 const CASCADES: [(f32, f32); 2] = [(0.1, 50.0), (35.0, 260.0)];
-const LOD_DIST: Vec4 = Vec4::new(40.0, 140.0, 500.0, 0.0);
 const MAX_TREE_DIST: f32 = 1600.0;
 /// Sun illuminance above the atmosphere, in the renderer's light units.
 const SUN_ILLUM: Vec3 = Vec3::new(3.4, 3.4, 3.4);
@@ -178,6 +178,8 @@ pub struct Settings {
     /// Draw the terrain and the near trees first, then cull the distant trees hidden behind
     /// them (`--no-occlusion` turns it off to compare). Needs the prepass.
     pub occlusion: bool,
+    /// Where the camera's trees switch to their second mesh and to impostors (`--lod`).
+    pub lod: [f32; 2],
 }
 
 #[derive(Default, Clone)]
@@ -187,7 +189,9 @@ pub struct Stats {
     /// Light on flat ground from the sun and sky (what the exposure adapts to).
     pub ground_light: f32,
     pub visible: [u32; DRAWS],
+    /// grass blades, and cards (grass tufts, flower and seed heads)
     pub grass: u32,
+    pub grass_cards: u32,
     pub tris: u64,
     /// Terrain patches picked by the LOD selection, then drawn by the camera, the near and
     /// the far shadow cascade.
@@ -332,7 +336,8 @@ pub struct Renderer {
     pub stats: Stats,
     frozen: Option<Frozen>,
     pub settings: Settings,
-    _leaf: Texture,
+    _foliage: Foliage,
+    _materials: Materials,
     _dummies: [Texture; 3],
 }
 
@@ -473,8 +478,13 @@ fn pad_planes(p: [Vec4; 6]) -> [Vec4; CULL_PLANES] {
 impl Renderer {
     pub fn new(device: &Device, queue: &Queue, timestamps: bool, width: u32, height: u32, out_format: TextureFormat, msaa: u32) -> Renderer {
         let t0 = std::time::Instant::now();
+        // the foliage atlases are composed on the CPU while the GPU work below gets going
+        let foliage_job = std::thread::spawn(foliage::compose_all);
         let terrain = Terrain::new(device, queue);
-        let (leaf_tex, leaf_view) = leaftex::build(device, queue);
+        let materials = Materials::new(device, queue);
+        let composed = foliage_job.join().expect("foliage thread");
+        let foliage = Foliage::upload(device, queue, &composed);
+        drop(composed);
 
         let all = ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::COMPUTE;
         let global_bgl = bgl(
@@ -496,6 +506,12 @@ impl Renderer {
                 texture_entry(12, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2),
                 texture_entry(13, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D3),
                 texture_entry(14, all, TextureSampleType::Float { filterable: true }, TextureViewDimension::D3),
+                // the scanned materials and the foliage's normals: only fragment shaders read them, which keeps the
+                // compute passes under the default 16 sampled textures per stage
+                texture_entry(15, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
+                texture_entry(16, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
+                sampler_entry(17, ShaderStages::FRAGMENT, SamplerBindingType::Filtering),
+                texture_entry(18, ShaderStages::FRAGMENT, TextureSampleType::Float { filterable: true }, TextureViewDimension::D2Array),
             ],
         );
         let clouds = Clouds::new(device, queue, &global_bgl, width, height);
@@ -567,6 +583,16 @@ impl Renderer {
             anisotropy_clamp: 8,
             ..Default::default()
         });
+        let s_mat = device.create_sampler(&SamplerDescriptor {
+            label: Some("material"),
+            address_mode_u: AddressMode::Repeat,
+            address_mode_v: AddressMode::Repeat,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..Default::default()
+        });
         let s_clamp = device.create_sampler(&SamplerDescriptor {
             label: Some("clamp"),
             mag_filter: FilterMode::Linear,
@@ -586,7 +612,7 @@ impl Renderer {
                     BindingResource::TextureView(shadow_view),
                     BindingResource::Sampler(&s_shadow),
                     BindingResource::Sampler(&s_leaf),
-                    BindingResource::TextureView(&leaf_view),
+                    BindingResource::TextureView(&foliage.view_a),
                     BindingResource::Sampler(&s_clamp),
                     sky.light_buf.as_entire_binding(),
                     BindingResource::TextureView(&sky.trans_view),
@@ -594,6 +620,10 @@ impl Renderer {
                     BindingResource::TextureView(cloud_shadow),
                     BindingResource::TextureView(ap_scat),
                     BindingResource::TextureView(ap_trans),
+                    BindingResource::TextureView(&materials.view_a),
+                    BindingResource::TextureView(&materials.view_b),
+                    BindingResource::Sampler(&s_mat),
+                    BindingResource::TextureView(&foliage.view_b),
                 ],
             )
         };
@@ -614,7 +644,7 @@ impl Renderer {
         let mut terrain = terrain;
         terrain.create_pipelines(device, &global_bgl, &pass_bgl, HDR, msaa);
         let mut forest = Forest::new(device, queue, &global_bgl, &global_bg, &pass_bgl, HDR, msaa, WORLD);
-        let undergrowth = Undergrowth::new(device, &global_bgl, &forest.tree_bgl);
+        let undergrowth = Undergrowth::new(device, &global_bgl, &forest);
         let grass = Grass::new(device, &global_bgl, &pass_bgl, HDR, msaa);
 
         // sky
@@ -676,7 +706,7 @@ impl Renderer {
 
         let readbacks = (0..3)
             .map(|_| Readback {
-                buf: buffer(device, "stats readback", 512, BufferUsages::COPY_DST | BufferUsages::MAP_READ),
+                buf: buffer(device, "stats readback", 288 + (DRAWS * 20) as u64, BufferUsages::COPY_DST | BufferUsages::MAP_READ),
                 queries: timestamps.then(|| device.create_query_set(&QuerySetDescriptor { label: Some("timestamps"), ty: QueryType::Timestamp, count: TIMESTAMPS })),
                 resolve: buffer(device, "query resolve", 256, BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC),
                 pending: false,
@@ -724,8 +754,9 @@ impl Renderer {
             frame_index: 0,
             stats: Stats::default(),
             frozen: None,
-            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true, prepass: true, occlusion: true },
-            _leaf: leaf_tex,
+            settings: Settings { lod_tint: false, freeze: false, grass: true, atmos: 1, sun_shift: 0.0, ssao: true, prepass: true, occlusion: true, lod: LOD_DIST },
+            _foliage: foliage,
+            _materials: materials,
             _dummies: [dummy_shadow, dummy_2d, dummy_3d],
         }
     }
@@ -802,7 +833,7 @@ impl Renderer {
             screen: Vec4::new(self.width as f32, self.height as f32, 1.0 / self.width as f32, 1.0 / self.height as f32),
             world: Vec4::new(WORLD, HM_RES as f32, WORLD / HM_RES as f32, SHADOW_RES as f32),
             cascade: Vec4::new(CASCADES[0].1, CASCADES[1].1, texel0, texel1),
-            lod: Vec4::new(LOD_DIST.x, LOD_DIST.y, LOD_DIST.z, MAX_TREE_DIST),
+            lod: Vec4::new(self.settings.lod[0], self.settings.lod[1], 0.0, MAX_TREE_DIST),
             debug: Vec4::new(if self.settings.lod_tint { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0),
             clouds: Vec4::new(atm.cloud_base, atm.cloud_top, atm.cloud_cover, atm.cloud_density),
             cloud_type: Vec4::new(atm.cloud_type.0, atm.cloud_type.1, atm.wind * 9.0, 0.0),
@@ -827,17 +858,18 @@ impl Renderer {
         // culling is frozen at another camera.
         let occlusion = self.settings.occlusion && self.settings.prepass && self.frozen.is_none();
         let proj = cam.proj(aspect);
+        let tree_lod = Vec4::new(self.settings.lod[0], self.settings.lod[1], 0.0, 0.0);
         self.forest.update_view(
             queue,
             0,
-            &ViewSetup { planes: pad_planes(cull_planes), ref_pos, max_dist: MAX_TREE_DIST, lod: LOD_DIST, occlusion: occlusion.then(|| (cam.view(), Vec2::new(proj.x_axis.x, proj.y_axis.y))) },
+            &ViewSetup { planes: pad_planes(cull_planes), ref_pos, max_dist: MAX_TREE_DIST, lod: tree_lod, occlusion: occlusion.then(|| (cam.view(), Vec2::new(proj.x_axis.x, proj.y_axis.y))) },
         );
         // what each cascade shades (shadow_at in globals.wgsl): the near one up to its far
         // distance, the far one from where the blend between them starts
         let receivers = [(0.0, CASCADES[0].1), (0.8 * CASCADES[0].1, CASCADES[1].1)];
         for (i, planes) in shadow_planes.iter().enumerate() {
-            let mut lod = LOD_DIST;
-            lod.w = [0.0f32, 3.0][i]; // far cascade casts from the cheap hull LOD only
+            let mut lod = tree_lod;
+            lod.w = [0.0f32, 2.0][i]; // the far cascade casts from the impostors only
             // a metre for wind sway and the normal offset, plus the filter's reach
             let margin = 1.0 + 3.0 * [texel0, texel1][i];
             let planes = caster_planes(cam, aspect, receivers[i].0, receivers[i].1, sun, margin).unwrap_or(pad_planes(*planes));
@@ -940,7 +972,10 @@ impl Renderer {
             rp.set_bind_group(1, &self.pass_bgs[1 + c], &[]);
             self.terrain.draw(&mut rp, 1 + c);
             rp.set_bind_group(2, &self.pass_bgs[1 + c], &[]);
-            self.forest.draw(&mut rp, 1 + c, TreePass::Shadow, 0..LODS);
+            self.forest.draw(&mut rp, 1 + c, TreePass::Shadow, if c == 0 { 0..LODS } else { OCCLUDER_LODS..LODS });
+            if c == 0 && self.settings.grass {
+                self.undergrowth.draw_shadow(&mut rp, self.forest.shadow_pipeline());
+            }
         }
         {
             let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
@@ -966,17 +1001,15 @@ impl Renderer {
             // removal: every leaf fragment that passes the depth test so far is shaded, in
             // whatever order the culling appended the trees. Laying down their depth first
             // (cheap: one texture read) lets the colour pass shade only the nearest surface.
-            // LOD 3 is an opaque hull with no leaf cards: nothing to gain, so it is drawn once.
             // (with occlusion culling the near LODs' depth is already there)
             if self.settings.prepass {
-                self.forest.draw(&mut rp, 0, TreePass::Depth, if occlusion { OCCLUDER_LODS..3 } else { 0..3 });
+                self.forest.draw(&mut rp, 0, TreePass::Depth, if occlusion { OCCLUDER_LODS..LODS } else { 0..LODS });
             }
             rp.set_bind_group(1, &self.pass_bgs[0], &[]);
             self.terrain.draw(&mut rp, 0);
             self.terrain.draw_canopy(&mut rp);
             if self.settings.prepass {
-                self.forest.draw(&mut rp, 0, TreePass::ColorEqual, 0..3);
-                self.forest.draw(&mut rp, 0, TreePass::Color, 3..LODS);
+                self.forest.draw(&mut rp, 0, TreePass::ColorEqual, 0..LODS);
             } else {
                 self.forest.draw(&mut rp, 0, TreePass::Color, 0..LODS);
             }
@@ -1024,9 +1057,9 @@ impl Renderer {
         // and in capture mode the GPU is idle between frames anyway.
         if staged {
             let rb = &self.readbacks[slot];
-            enc.copy_buffer_to_buffer(&self.forest.views[0].args_buf, 0, &rb.buf, 256, (DRAWS * 20) as u64);
-            enc.copy_buffer_to_buffer(&self.grass.args_buf, 0, &rb.buf, 496, 16);
-            enc.copy_buffer_to_buffer(&self.sky.light_buf, 0, &rb.buf, 64, 64);
+            enc.copy_buffer_to_buffer(&self.grass.args_buf, 0, &rb.buf, 256, 32);
+            enc.copy_buffer_to_buffer(&self.forest.views[0].args_buf, 0, &rb.buf, 288, (DRAWS * 20) as u64);
+            enc.copy_buffer_to_buffer(&self.sky.light_buf, 0, &rb.buf, 128, 64);
         }
         let mut resolved = Vec::new();
         for (k, rb) in self.readbacks.iter_mut().enumerate() {
@@ -1070,15 +1103,16 @@ impl Renderer {
                         self.timings.push(t);
                     }
                 }
-                self.stats.ground_light = f32::from_bits(words[16 + 15]);
+                self.stats.ground_light = f32::from_bits(words[32 + 15]);
                 let mut tris = self.terrain.drawn(0) as u64 * PATCH_TRIS as u64;
                 for d in 0..DRAWS {
-                    let n = words[64 + d * 5 + 1];
+                    let n = words[72 + d * 5 + 1];
                     self.stats.visible[d] = n;
                     tris += n as u64 * self.forest.draws[d].tris as u64;
                 }
-                self.stats.grass = if self.settings.grass { words[124 + 1] } else { 0 };
-                tris += self.stats.grass as u64 * 5;
+                self.stats.grass = if self.settings.grass { words[64 + 1] } else { 0 };
+                self.stats.grass_cards = if self.settings.grass { words[68 + 1] } else { 0 };
+                tris += self.stats.grass as u64 * 5 + self.stats.grass_cards as u64 * 2;
                 self.stats.tris = tris;
                 self.stats.patches = [self.terrain.selected, self.terrain.drawn(0), self.terrain.drawn(1), self.terrain.drawn(2)];
             }
